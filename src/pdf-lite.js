@@ -81,7 +81,7 @@ class PdfLiteDocument {
     context.fillRect(0, 0, width * scale, height * scale);
     const renderer = new ContentRenderer(this, page, context, { scale, width, height });
     const streams = await this.getPageContentStreams(page);
-    renderer.interpret(streams.map((stream) => bytesToBinaryString(stream)).join("\n"));
+    await renderer.interpret(streams.map((stream) => bytesToBinaryString(stream)).join("\n"));
     return { unsupportedOperators: renderer.unsupportedOperators };
   }
 
@@ -227,6 +227,10 @@ class PdfLiteDocument {
     return output;
   }
 
+  objectFor(value) {
+    return value?.ref ? this.objects.get(value.ref) : Array.from(this.objects.values()).find((object) => object.value === value);
+  }
+
   resolve(value, depth = 0) {
     if (depth > 20) {
       return value;
@@ -249,7 +253,9 @@ class ContentRenderer {
     this.stack = [];
     this.state = this.defaultState();
     this.unsupportedOperators = new Map();
-    this.fonts = this.pdf.resolve(page.resources?.Font) || {};
+    this.resources = page.resources || {};
+    this.resourceStack = [];
+    this.xObjectDepth = 0;
   }
 
   defaultState() {
@@ -257,7 +263,15 @@ class ContentRenderer {
       ctm: [1, 0, 0, 1, 0, 0],
       fill: "#000",
       stroke: "#000",
+      fillColorSpace: "DeviceGray",
+      strokeColorSpace: "DeviceGray",
+      fillAlpha: 1,
+      strokeAlpha: 1,
       lineWidth: 1,
+      lineDash: [],
+      lineDashOffset: 0,
+      miterLimit: 10,
+      currentPoint: null,
       fontName: null,
       fontSize: 10,
       charSpacing: 0,
@@ -270,7 +284,7 @@ class ContentRenderer {
     };
   }
 
-  interpret(content) {
+  async interpret(content) {
     const tokens = tokenizeContent(content);
     const operands = [];
     for (const token of tokens) {
@@ -278,11 +292,11 @@ class ContentRenderer {
         operands.push(token.value);
         continue;
       }
-      this.applyOperator(token.value, operands.splice(0));
+      await this.applyOperator(token.value, operands.splice(0));
     }
   }
 
-  applyOperator(operator, operands) {
+  async applyOperator(operator, operands) {
     switch (operator) {
       case "q":
         this.stack.push(structuredClone(this.state));
@@ -295,6 +309,13 @@ class ContentRenderer {
         break;
       case "w":
         this.state.lineWidth = Number(operands.at(-1)) || 1;
+        break;
+      case "M":
+        this.state.miterLimit = Number(operands.at(-1)) || 10;
+        break;
+      case "d":
+        this.state.lineDash = Array.isArray(operands[0]) ? operands[0].map(Number) : [];
+        this.state.lineDashOffset = Number(operands[1]) || 0;
         break;
       case "J":
         this.context.lineCap = ["butt", "round", "square"][Number(operands.at(-1))] || "butt";
@@ -309,6 +330,26 @@ class ContentRenderer {
       case "RG":
       case "G":
         this.state.stroke = colorFromOperands(operator, operands);
+        break;
+      case "cs":
+        this.state.fillColorSpace = operands.at(-1) || this.state.fillColorSpace;
+        break;
+      case "CS":
+        this.state.strokeColorSpace = operands.at(-1) || this.state.strokeColorSpace;
+        break;
+      case "sc":
+      case "scn":
+        this.state.fill = colorFromColorSpace(this.colorSpace(this.state.fillColorSpace), operands);
+        break;
+      case "SC":
+      case "SCN":
+        this.state.stroke = colorFromColorSpace(this.colorSpace(this.state.strokeColorSpace), operands);
+        break;
+      case "gs":
+        this.applyGraphicsState(operands.at(-1));
+        break;
+      case "ri":
+      case "i":
         break;
       case "BT":
         this.state.textMatrix = [1, 0, 0, 1, 0, 0];
@@ -369,11 +410,23 @@ class ContentRenderer {
       case "TJ":
         this.showTextArray(operands.at(-1));
         break;
+      case "Do":
+        await this.paintXObject(operands.at(-1));
+        break;
       case "m":
         this.pathMove(operands);
         break;
       case "l":
         this.pathLine(operands);
+        break;
+      case "c":
+        this.pathCurve(operands);
+        break;
+      case "v":
+        this.pathCurveFromCurrent(operands);
+        break;
+      case "y":
+        this.pathCurveToFinalPoint(operands);
         break;
       case "re":
         this.pathRect(operands);
@@ -408,7 +461,7 @@ class ContentRenderer {
       case "DP":
         break;
       default:
-        this.unsupportedOperators.set(operator, (this.unsupportedOperators.get(operator) || 0) + 1);
+        this.unsupported(operator);
     }
   }
 
@@ -440,6 +493,7 @@ class ContentRenderer {
     const fontSize = Math.abs(this.state.fontSize * this.state.ctm[3] * this.scale);
     this.context.save();
     this.context.fillStyle = this.state.fill;
+    this.context.globalAlpha = this.state.fillAlpha;
     this.context.font = canvasFontFor(this.currentFont(), fontSize);
     this.context.scale(this.state.horizontalScale, 1);
     this.context.fillText(text, (x * this.scale) / this.state.horizontalScale, (this.pageHeight - y - this.state.textRise) * this.scale);
@@ -467,22 +521,234 @@ class ContentRenderer {
   }
 
   currentFont() {
-    const ref = this.fonts[this.state.fontName];
+    const fonts = this.pdf.resolve(this.resources?.Font) || {};
+    const ref = fonts[this.state.fontName];
     if (!ref?.ref) {
       return null;
     }
     return this.pdf.fonts.get(ref.ref);
   }
 
+  colorSpace(name) {
+    const colorSpaces = this.pdf.resolve(this.resources?.ColorSpace) || {};
+    return this.pdf.resolve(colorSpaces[name]) || name;
+  }
+
+  applyGraphicsState(name) {
+    const states = this.pdf.resolve(this.resources?.ExtGState) || {};
+    const graphicsState = this.pdf.resolve(states[name]);
+    if (!graphicsState) {
+      return;
+    }
+    if (typeof graphicsState.ca === "number") {
+      this.state.fillAlpha = graphicsState.ca;
+    }
+    if (typeof graphicsState.CA === "number") {
+      this.state.strokeAlpha = graphicsState.CA;
+    }
+    if (typeof graphicsState.LW === "number") {
+      this.state.lineWidth = graphicsState.LW;
+    }
+    if (typeof graphicsState.LC === "number") {
+      this.context.lineCap = ["butt", "round", "square"][graphicsState.LC] || "butt";
+    }
+    if (typeof graphicsState.LJ === "number") {
+      this.context.lineJoin = ["miter", "round", "bevel"][graphicsState.LJ] || "miter";
+    }
+    if (typeof graphicsState.ML === "number") {
+      this.state.miterLimit = graphicsState.ML;
+    }
+    if (Array.isArray(graphicsState.D)) {
+      this.state.lineDash = Array.isArray(graphicsState.D[0]) ? graphicsState.D[0].map(Number) : [];
+      this.state.lineDashOffset = Number(graphicsState.D[1]) || 0;
+    }
+  }
+
+  async paintXObject(name) {
+    const xObjects = this.pdf.resolve(this.resources?.XObject) || {};
+    const object = this.pdf.objectFor(xObjects[name]);
+    const dictionary = object?.value;
+    if (!object?.stream || !dictionary) {
+      this.unsupported("Do");
+      return;
+    }
+    if (dictionary.Subtype === "Form") {
+      await this.paintFormXObject(object);
+      return;
+    }
+    if (dictionary.Subtype === "Image") {
+      await this.paintImageXObject(object);
+      return;
+    }
+    this.unsupported(`Do/${dictionary.Subtype || "unknown"}`);
+  }
+
+  async paintFormXObject(object) {
+    if (this.xObjectDepth > 12) {
+      this.unsupported("Do/FormDepth");
+      return;
+    }
+    const dictionary = object.value;
+    let stream;
+    try {
+      stream = await this.pdf.decodeStream(object.stream.bytes, dictionary);
+    } catch (error) {
+      this.unsupported("Do/FormFilter");
+      return;
+    }
+    this.context.save();
+    this.resourceStack.push(this.resources);
+    const previousState = structuredClone(this.state);
+    this.xObjectDepth += 1;
+    this.resources = this.pdf.resolve(dictionary.Resources) || this.resources;
+    const matrix = numericArray(this.pdf.resolve(dictionary.Matrix));
+    if (matrix) {
+      this.state.ctm = multiplyMatrix(this.state.ctm, matrix);
+    }
+    await this.interpret(bytesToBinaryString(stream));
+    this.state = previousState;
+    this.resources = this.resourceStack.pop() || this.page.resources || {};
+    this.xObjectDepth -= 1;
+    this.context.restore();
+  }
+
+  async paintImageXObject(object) {
+    const filters = normalizeFilters(this.pdf.resolve(object.value.Filter));
+    try {
+      if (filters.length === 1 && ["DCTDecode", "DCT"].includes(filters[0])) {
+        const image = await createImageBitmap(new Blob([object.stream.bytes], { type: "image/jpeg" }));
+        this.drawUnitImage(image);
+        image.close?.();
+        return;
+      }
+      if (filters.length <= 1 && (!filters.length || ["FlateDecode", "Fl"].includes(filters[0]))) {
+        const imageData = await this.imageDataForXObject(object);
+        if (imageData) {
+          const image = await createImageBitmap(imageData);
+          this.drawUnitImage(image);
+          image.close?.();
+          return;
+        }
+      }
+      this.unsupported(`Do/Image/${filters.join("+") || "raw"}`);
+    } catch (error) {
+      this.unsupported("Do/ImageDecode");
+    }
+  }
+
+  drawUnitImage(image) {
+    const [a, b, c, d, e, f] = this.state.ctm;
+    this.context.save();
+    this.context.transform(a * this.scale, -b * this.scale, c * this.scale, -d * this.scale, e * this.scale, (this.pageHeight - f) * this.scale);
+    this.context.transform(1, 0, 0, -1, 0, 1);
+    this.context.drawImage(image, 0, 0, 1, 1);
+    this.context.restore();
+  }
+
+  async imageDataForXObject(object) {
+    const dictionary = object.value;
+    const width = Number(this.pdf.resolve(dictionary.Width));
+    const height = Number(this.pdf.resolve(dictionary.Height));
+    const bits = Number(this.pdf.resolve(dictionary.BitsPerComponent));
+    if (!Number.isFinite(width) || !Number.isFinite(height) || bits !== 8) {
+      return null;
+    }
+    const pixels = await this.pdf.decodeStream(object.stream.bytes, dictionary);
+    const components = imageComponents(this.pdf.resolve(dictionary.ColorSpace), pixels.length, width, height);
+    if (![1, 3, 4].includes(components)) {
+      return null;
+    }
+    const expectedLength = width * height * components;
+    if (pixels.length < expectedLength) {
+      return null;
+    }
+    const alpha = await this.imageAlphaForXObject(dictionary, width, height);
+    const imageData = new ImageData(width, height);
+    for (let pixelIndex = 0; pixelIndex < width * height; pixelIndex += 1) {
+      const sourceIndex = pixelIndex * components;
+      const targetIndex = pixelIndex * 4;
+      if (components === 1) {
+        const gray = pixels[sourceIndex];
+        imageData.data[targetIndex] = gray;
+        imageData.data[targetIndex + 1] = gray;
+        imageData.data[targetIndex + 2] = gray;
+      } else if (components === 4) {
+        const [red, green, blue] = cmykToRgb(pixels[sourceIndex], pixels[sourceIndex + 1], pixels[sourceIndex + 2], pixels[sourceIndex + 3]);
+        imageData.data[targetIndex] = red;
+        imageData.data[targetIndex + 1] = green;
+        imageData.data[targetIndex + 2] = blue;
+      } else {
+        imageData.data[targetIndex] = pixels[sourceIndex];
+        imageData.data[targetIndex + 1] = pixels[sourceIndex + 1];
+        imageData.data[targetIndex + 2] = pixels[sourceIndex + 2];
+      }
+      imageData.data[targetIndex + 3] = alpha?.[pixelIndex] ?? 255;
+    }
+    return imageData;
+  }
+
+  async imageAlphaForXObject(dictionary, width, height) {
+    const maskObject = this.pdf.objectFor(dictionary.SMask);
+    if (!maskObject?.stream) {
+      return null;
+    }
+    const mask = maskObject.value;
+    const maskWidth = Number(this.pdf.resolve(mask.Width));
+    const maskHeight = Number(this.pdf.resolve(mask.Height));
+    const bits = Number(this.pdf.resolve(mask.BitsPerComponent));
+    if (maskWidth !== width || maskHeight !== height || bits !== 8) {
+      return null;
+    }
+    const filters = normalizeFilters(this.pdf.resolve(mask.Filter));
+    if (filters.length > 1 || (filters.length === 1 && !["FlateDecode", "Fl"].includes(filters[0]))) {
+      return null;
+    }
+    const pixels = await this.pdf.decodeStream(maskObject.stream.bytes, mask);
+    const components = imageComponents(this.pdf.resolve(mask.ColorSpace), pixels.length, width, height);
+    if (components !== 1 || pixels.length < width * height) {
+      return null;
+    }
+    return pixels;
+  }
+
+  unsupported(operator) {
+    this.unsupportedOperators.set(operator, (this.unsupportedOperators.get(operator) || 0) + 1);
+  }
+
   pathMove(operands) {
     const [x, y] = this.point(operands[0], operands[1]);
     this.context.beginPath();
     this.context.moveTo(x, y);
+    this.state.currentPoint = [Number(operands[0]) || 0, Number(operands[1]) || 0];
   }
 
   pathLine(operands) {
     const [x, y] = this.point(operands[0], operands[1]);
     this.context.lineTo(x, y);
+    this.state.currentPoint = [Number(operands[0]) || 0, Number(operands[1]) || 0];
+  }
+
+  pathCurve(operands) {
+    const [x1, y1] = this.point(operands[0], operands[1]);
+    const [x2, y2] = this.point(operands[2], operands[3]);
+    const [x3, y3] = this.point(operands[4], operands[5]);
+    this.context.bezierCurveTo(x1, y1, x2, y2, x3, y3);
+    this.state.currentPoint = [Number(operands[4]) || 0, Number(operands[5]) || 0];
+  }
+
+  pathCurveFromCurrent(operands) {
+    const [x1, y1] = this.point(...(this.state.currentPoint || [0, 0]));
+    const [x2, y2] = this.point(operands[0], operands[1]);
+    const [x3, y3] = this.point(operands[2], operands[3]);
+    this.context.bezierCurveTo(x1, y1, x2, y2, x3, y3);
+    this.state.currentPoint = [Number(operands[2]) || 0, Number(operands[3]) || 0];
+  }
+
+  pathCurveToFinalPoint(operands) {
+    const [x1, y1] = this.point(operands[0], operands[1]);
+    const [x2, y2] = this.point(operands[2], operands[3]);
+    this.context.bezierCurveTo(x1, y1, x2, y2, x2, y2);
+    this.state.currentPoint = [Number(operands[2]) || 0, Number(operands[3]) || 0];
   }
 
   pathRect(operands) {
@@ -491,6 +757,7 @@ class ContentRenderer {
     const height = Number(operands[3]) * this.scale;
     this.context.beginPath();
     this.context.rect(x, y - height, width, height);
+    this.state.currentPoint = null;
   }
 
   point(x, y) {
@@ -501,18 +768,25 @@ class ContentRenderer {
   stroke() {
     this.context.save();
     this.context.strokeStyle = this.state.stroke;
+    this.context.globalAlpha = this.state.strokeAlpha;
     this.context.lineWidth = this.state.lineWidth * this.scale;
+    this.context.miterLimit = this.state.miterLimit;
+    this.context.setLineDash(this.state.lineDash.map((value) => value * this.scale));
+    this.context.lineDashOffset = this.state.lineDashOffset * this.scale;
     this.context.stroke();
     this.context.restore();
     this.context.beginPath();
+    this.state.currentPoint = null;
   }
 
   fill() {
     this.context.save();
     this.context.fillStyle = this.state.fill;
+    this.context.globalAlpha = this.state.fillAlpha;
     this.context.fill();
     this.context.restore();
     this.context.beginPath();
+    this.state.currentPoint = null;
   }
 }
 
@@ -788,6 +1062,40 @@ function numericArray(value) {
   return Array.isArray(value) && value.every((item) => typeof item === "number") ? value : null;
 }
 
+function imageComponents(colorSpace, byteLength, width, height) {
+  const name = Array.isArray(colorSpace) ? colorSpace[0] : colorSpace;
+  if (name === "DeviceGray") {
+    return 1;
+  }
+  if (name === "DeviceRGB") {
+    return 3;
+  }
+  if (name === "DeviceCMYK") {
+    return 4;
+  }
+  if (name === "ICCBased") {
+    const profile = colorSpace?.[1];
+    const components = Number(profile?.N);
+    if ([1, 3, 4].includes(components)) {
+      return components;
+    }
+  }
+  const inferred = byteLength / Math.max(1, width * height);
+  return Number.isInteger(inferred) ? inferred : 0;
+}
+
+function cmykToRgb(cyanByte, magentaByte, yellowByte, blackByte) {
+  const cyan = cyanByte / 255;
+  const magenta = magentaByte / 255;
+  const yellow = yellowByte / 255;
+  const black = blackByte / 255;
+  return [
+    Math.round(255 * (1 - cyan) * (1 - black)),
+    Math.round(255 * (1 - magenta) * (1 - black)),
+    Math.round(255 * (1 - yellow) * (1 - black)),
+  ];
+}
+
 function parseToUnicodeCMap(source) {
   const map = new Map();
   const bfcharPattern = /beginbfchar([\s\S]*?)endbfchar/g;
@@ -804,10 +1112,10 @@ function parseToUnicodeCMap(source) {
     for (const range of ranges) {
       const start = parseInt(range[1], 16);
       const end = parseInt(range[2], 16);
-      const target = parseInt(range[3], 16);
+      const target = hexToUnicode(range[3]);
       const width = range[1].length;
       for (let code = start; code <= end && code - start < 512; code += 1) {
-        map.set(code.toString(16).toUpperCase().padStart(width, "0"), String.fromCodePoint(target + code - start));
+        map.set(code.toString(16).toUpperCase().padStart(width, "0"), incrementUnicodeString(target, code - start));
       }
     }
     const arrayRanges = Array.from(match[1].matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*\[([^\]]+)\]/g));
@@ -827,9 +1135,22 @@ function parseToUnicodeCMap(source) {
 function hexToUnicode(hex) {
   const chars = [];
   for (let index = 0; index < hex.length; index += 4) {
-    chars.push(String.fromCodePoint(parseInt(hex.slice(index, index + 4), 16)));
+    chars.push(String.fromCharCode(parseInt(hex.slice(index, index + 4), 16)));
   }
   return chars.join("");
+}
+
+function incrementUnicodeString(text, offset) {
+  if (!offset) {
+    return text;
+  }
+  const chars = Array.from(text);
+  const last = chars.pop() || "";
+  const codePoint = last.codePointAt(0);
+  if (!Number.isFinite(codePoint)) {
+    return text;
+  }
+  return `${chars.join("")}${String.fromCodePoint(codePoint + offset)}`;
 }
 
 function textTokenToBytes(value) {
@@ -897,6 +1218,32 @@ function colorFromOperands(operator, operands) {
   }
   const [red, green, blue] = operands.slice(-3).map((value) => Math.round((Number(value) || 0) * 255));
   return `rgb(${red}, ${green}, ${blue})`;
+}
+
+function colorFromColorSpace(colorSpace, operands) {
+  const components = operands.filter((operand) => typeof operand === "number");
+  const name = Array.isArray(colorSpace) ? colorSpace[0] : colorSpace;
+  if (name === "DeviceGray" || components.length === 1) {
+    const value = colorComponent(components[0]);
+    return `rgb(${value}, ${value}, ${value})`;
+  }
+  if (name === "DeviceCMYK" || components.length >= 4) {
+    const [cyan, magenta, yellow, black] = components.map((value) => clamp01(value));
+    const red = colorComponent((1 - cyan) * (1 - black));
+    const green = colorComponent((1 - magenta) * (1 - black));
+    const blue = colorComponent((1 - yellow) * (1 - black));
+    return `rgb(${red}, ${green}, ${blue})`;
+  }
+  const [red, green, blue] = components.slice(-3).map(colorComponent);
+  return `rgb(${red || 0}, ${green || 0}, ${blue || 0})`;
+}
+
+function colorComponent(value) {
+  return Math.round(clamp01(value) * 255);
+}
+
+function clamp01(value) {
+  return Math.min(1, Math.max(0, Number(value) || 0));
 }
 
 function canvasFontFor(font, fontSize) {

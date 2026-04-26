@@ -92,6 +92,11 @@ Currently useful capabilities include:
 - page content stream concatenation
 - basic `ToUnicode` CMap reading
 - a small subset of text and path operators
+- cubic Bezier path rendering for vector-heavy pages
+- basic graphics state alpha, dash, miter, and color-space color operands
+- Form XObject interpretation
+- JPEG image XObject rendering via browser image decoding
+- simple 8-bit raw and Flate image XObject rendering for gray, RGB, ICC-like, and CMYK-like data, including grayscale soft masks
 - common PDF base-font mapping to browser font families
 - unsupported-operator reporting
 - literal-string octal escape decoding for some documents without `ToUnicode` maps
@@ -99,9 +104,9 @@ Currently useful capabilities include:
 Known gaps include:
 
 - embedded font shaping and real font program interpretation
-- image XObjects
-- form XObjects
-- external graphics state handling
+- JPX/JPEG 2000, indexed, predictor-heavy, masked, and complex image XObjects
+- full external graphics state handling
+- calibrated, ICC, indexed, separation, and pattern color spaces
 - clipping behavior beyond accepted no-ops
 - filters beyond `FlateDecode`
 

@@ -61,10 +61,22 @@ const BT_DRUCKSACHEN = [
     pdfPath: "Antrag-nach-47-Abs.-6-VwGO_Ueberwachung-von-Online-Pruefungen_Gesellschaft-fuer-Freiheitsrechte.pdf"
   },
   {
+    id: "ki-pruefungen-handreichung-2026",
+    type: "guidance",
+    title: "Handreichung KI und Pruefungen",
+    pdfPath: "Handreichung_KI_und_Pruefungen_de_25.03.2026.pdf"
+  },
+  {
     id: "thueringer-olg-2025-redacted",
     type: "court decision",
     title: "Urteil des Thueringer OLG 2025, geschwaerzt",
     pdfPath: "Urteil-des-Thueringer-OLG-vom-13.10.2025-verkuendet-am-17.11.2025-Kopie_geschwaerzt.pdf"
+  },
+  {
+    id: "claude-mythos-preview-system-card",
+    type: "sample",
+    title: "Claude Mythos Preview System Card",
+    pdfPath: "Claude Mythos Preview System Card.pdf"
   },
   {
     id: "fundamentacao",
