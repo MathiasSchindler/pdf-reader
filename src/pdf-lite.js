@@ -1,0 +1,936 @@
+const WHITESPACE = new Set([0, 9, 10, 12, 13, 32]);
+const DELIMITERS = new Set([40, 41, 60, 62, 91, 93, 123, 125, 47, 37]);
+const WIN_ANSI = new Map([
+  [0x80, "€"], [0x82, "‚"], [0x83, "ƒ"], [0x84, "„"], [0x85, "…"], [0x86, "†"], [0x87, "‡"],
+  [0x88, "ˆ"], [0x89, "‰"], [0x8a, "Š"], [0x8b, "‹"], [0x8c, "Œ"], [0x8e, "Ž"], [0x91, "‘"],
+  [0x92, "’"], [0x93, "“"], [0x94, "”"], [0x95, "•"], [0x96, "–"], [0x97, "—"], [0x98, "˜"],
+  [0x99, "™"], [0x9a, "š"], [0x9b, "›"], [0x9c, "œ"], [0x9e, "ž"], [0x9f, "Ÿ"]
+]);
+
+export async function loadPdfLite(url) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Could not fetch ${url}: ${response.status}`);
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const pdf = new PdfLiteDocument(bytes, url);
+  await pdf.parse();
+  return pdf;
+}
+
+class PdfLiteDocument {
+  constructor(bytes, url) {
+    this.bytes = bytes;
+    this.url = url;
+    this.source = bytesToBinaryString(bytes);
+    this.objects = new Map();
+    this.directObjects = 0;
+    this.objectStreams = 0;
+    this.decodedObjectStreams = 0;
+    this.filters = new Map();
+    this.fonts = new Map();
+    this.pages = [];
+    this.warnings = [];
+  }
+
+  async parse() {
+    this.readDirectObjects();
+    await this.readObjectStreams();
+    this.collectPages();
+    await this.collectFonts();
+  }
+
+  audit() {
+    return {
+      url: this.url,
+      version: this.source.match(/%PDF-([^\r\n]+)/)?.[1] || "unknown",
+      objects: this.objects.size,
+      directObjects: this.directObjects,
+      objectStreams: this.objectStreams,
+      decodedObjectStreams: this.decodedObjectStreams,
+      pages: this.pages.length,
+      filters: Object.fromEntries(Array.from(this.filters).sort()),
+      fonts: Array.from(this.fonts.values()).map((font) => ({
+        name: font.resourceName,
+        subtype: font.subtype,
+        baseFont: font.baseFont,
+        hasToUnicode: Boolean(font.toUnicode),
+        cmapEntries: font.toUnicode?.size || 0,
+      })),
+      warnings: this.warnings,
+    };
+  }
+
+  async renderPage(index, canvas, options = {}) {
+    const page = this.pages[index];
+    if (!page) {
+      throw new Error(`Page ${index + 1} not found`);
+    }
+    const scale = options.scale || 1;
+    const mediaBox = page.mediaBox || [0, 0, 595, 842];
+    const width = Math.abs(mediaBox[2] - mediaBox[0]);
+    const height = Math.abs(mediaBox[3] - mediaBox[1]);
+    const pixelRatio = window.devicePixelRatio || 1;
+    canvas.width = Math.floor(width * scale * pixelRatio);
+    canvas.height = Math.floor(height * scale * pixelRatio);
+    canvas.style.width = `${Math.floor(width * scale)}px`;
+    canvas.style.height = `${Math.floor(height * scale)}px`;
+    const context = canvas.getContext("2d");
+    context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+    context.fillStyle = "#fff";
+    context.fillRect(0, 0, width * scale, height * scale);
+    const renderer = new ContentRenderer(this, page, context, { scale, width, height });
+    const streams = await this.getPageContentStreams(page);
+    renderer.interpret(streams.map((stream) => bytesToBinaryString(stream)).join("\n"));
+    return { unsupportedOperators: renderer.unsupportedOperators };
+  }
+
+  readDirectObjects() {
+    const objectPattern = /(\d+)\s+(\d+)\s+obj\b/g;
+    let match;
+    while ((match = objectPattern.exec(this.source))) {
+      const id = Number(match[1]);
+      const generation = Number(match[2]);
+      const start = match.index + match[0].length;
+      const end = this.source.indexOf("endobj", start);
+      if (end < 0) {
+        continue;
+      }
+      const raw = this.source.slice(start, end).trim();
+      const parsed = parsePdfObject(raw);
+      const stream = extractStream(this.source, this.bytes, start, end, parsed.value);
+      this.objects.set(id, { id, generation, value: parsed.value, stream });
+      this.directObjects += 1;
+      recordFilter(this.filters, parsed.value);
+      objectPattern.lastIndex = end + 6;
+    }
+  }
+
+  async readObjectStreams() {
+    const streams = Array.from(this.objects.values()).filter((object) => object.value?.Type === "ObjStm" && object.stream);
+    this.objectStreams = streams.length;
+    for (const object of streams) {
+      try {
+        const decoded = await this.decodeStream(object.stream.bytes, object.value);
+        const headerLength = Number(resolvePrimitive(this, object.value.First)) || 0;
+        const objectCount = Number(resolvePrimitive(this, object.value.N)) || 0;
+        const decodedText = bytesToBinaryString(decoded);
+        const header = decodedText.slice(0, headerLength).trim().split(/\s+/).map(Number);
+        const body = decodedText.slice(headerLength);
+        for (let index = 0; index < objectCount; index += 1) {
+          const objectId = header[index * 2];
+          const offset = header[index * 2 + 1];
+          if (!Number.isFinite(objectId) || !Number.isFinite(offset)) {
+            continue;
+          }
+          const parser = new PdfValueParser(body, offset);
+          const value = parser.parseValue();
+          if (!this.objects.has(objectId)) {
+            this.objects.set(objectId, { id: objectId, generation: 0, value, stream: null, compressedIn: object.id });
+            recordFilter(this.filters, value);
+          }
+        }
+        this.decodedObjectStreams += 1;
+      } catch (error) {
+        this.warnings.push(`Could not decode object stream ${object.id}: ${error.message}`);
+      }
+    }
+  }
+
+  collectPages() {
+    const catalog = Array.from(this.objects.values()).find((object) => object.value?.Type === "Catalog")?.value;
+    const pagesRoot = this.resolve(catalog?.Pages);
+    this.pages = [];
+    this.walkPages(pagesRoot, {});
+  }
+
+  walkPages(node, inherited) {
+    if (!node) {
+      return;
+    }
+    const nextInherited = {
+      resources: this.resolve(node.Resources) || inherited.resources,
+      mediaBox: numericArray(this.resolve(node.MediaBox)) || inherited.mediaBox,
+    };
+    if (node.Type === "Page") {
+      this.pages.push({
+        object: node,
+        resources: nextInherited.resources,
+        mediaBox: nextInherited.mediaBox || [0, 0, 595, 842],
+        contents: node.Contents,
+      });
+      return;
+    }
+    const kids = this.resolve(node.Kids) || [];
+    for (const kid of kids) {
+      this.walkPages(this.resolve(kid), nextInherited);
+    }
+  }
+
+  async collectFonts() {
+    for (const page of this.pages) {
+      const fonts = this.resolve(page.resources?.Font) || {};
+      for (const [resourceName, fontRef] of Object.entries(fonts)) {
+        const objectId = fontRef?.ref || `${resourceName}:${Object.keys(this.fonts).length}`;
+        if (this.fonts.has(objectId)) {
+          continue;
+        }
+        const font = this.resolve(fontRef) || {};
+        const toUnicodeRef = font.ToUnicode;
+        let toUnicode = null;
+        if (toUnicodeRef?.ref) {
+          const cmapObject = this.objects.get(toUnicodeRef.ref);
+          if (cmapObject?.stream) {
+            try {
+              const cmapBytes = await this.decodeStream(cmapObject.stream.bytes, cmapObject.value);
+              toUnicode = parseToUnicodeCMap(bytesToBinaryString(cmapBytes));
+            } catch (error) {
+              this.warnings.push(`Could not decode ToUnicode map for ${resourceName}: ${error.message}`);
+            }
+          }
+        }
+        this.fonts.set(objectId, {
+          objectId,
+          resourceName,
+          subtype: font.Subtype || "unknown",
+          baseFont: font.BaseFont || "unknown",
+          toUnicode,
+        });
+      }
+    }
+  }
+
+  async getPageContentStreams(page) {
+    const contents = page.contents;
+    const resolvedContents = this.resolve(contents);
+    const refs = Array.isArray(contents) ? contents : Array.isArray(resolvedContents) ? resolvedContents : [contents];
+    const streams = [];
+    for (const ref of refs) {
+      const object = ref?.ref ? this.objects.get(ref.ref) : Array.from(this.objects.values()).find((candidate) => candidate.value === ref);
+      if (object?.stream) {
+        streams.push(await this.decodeStream(object.stream.bytes, object.value));
+      }
+    }
+    return streams;
+  }
+
+  async decodeStream(bytes, dictionary = {}) {
+    const filters = normalizeFilters(this.resolve(dictionary.Filter));
+    let output = bytes;
+    for (const filter of filters) {
+      if (filter === "FlateDecode" || filter === "Fl") {
+        output = await inflate(output);
+      } else {
+        throw new Error(`Unsupported stream filter ${filter}`);
+      }
+    }
+    return output;
+  }
+
+  resolve(value, depth = 0) {
+    if (depth > 20) {
+      return value;
+    }
+    if (value?.ref) {
+      return this.resolve(this.objects.get(value.ref)?.value, depth + 1);
+    }
+    return value;
+  }
+}
+
+class ContentRenderer {
+  constructor(pdf, page, context, metrics) {
+    this.pdf = pdf;
+    this.page = page;
+    this.context = context;
+    this.scale = metrics.scale;
+    this.pageWidth = metrics.width;
+    this.pageHeight = metrics.height;
+    this.stack = [];
+    this.state = this.defaultState();
+    this.unsupportedOperators = new Map();
+    this.fonts = this.pdf.resolve(page.resources?.Font) || {};
+  }
+
+  defaultState() {
+    return {
+      ctm: [1, 0, 0, 1, 0, 0],
+      fill: "#000",
+      stroke: "#000",
+      lineWidth: 1,
+      fontName: null,
+      fontSize: 10,
+      charSpacing: 0,
+      wordSpacing: 0,
+      horizontalScale: 1,
+      leading: 0,
+      textRise: 0,
+      textMatrix: [1, 0, 0, 1, 0, 0],
+      lineMatrix: [1, 0, 0, 1, 0, 0],
+    };
+  }
+
+  interpret(content) {
+    const tokens = tokenizeContent(content);
+    const operands = [];
+    for (const token of tokens) {
+      if (token.type !== "operator") {
+        operands.push(token.value);
+        continue;
+      }
+      this.applyOperator(token.value, operands.splice(0));
+    }
+  }
+
+  applyOperator(operator, operands) {
+    switch (operator) {
+      case "q":
+        this.stack.push(structuredClone(this.state));
+        break;
+      case "Q":
+        this.state = this.stack.pop() || this.defaultState();
+        break;
+      case "cm":
+        this.state.ctm = multiplyMatrix(this.state.ctm, operands.slice(-6).map(Number));
+        break;
+      case "w":
+        this.state.lineWidth = Number(operands.at(-1)) || 1;
+        break;
+      case "J":
+        this.context.lineCap = ["butt", "round", "square"][Number(operands.at(-1))] || "butt";
+        break;
+      case "j":
+        this.context.lineJoin = ["miter", "round", "bevel"][Number(operands.at(-1))] || "miter";
+        break;
+      case "rg":
+      case "g":
+        this.state.fill = colorFromOperands(operator, operands);
+        break;
+      case "RG":
+      case "G":
+        this.state.stroke = colorFromOperands(operator, operands);
+        break;
+      case "BT":
+        this.state.textMatrix = [1, 0, 0, 1, 0, 0];
+        this.state.lineMatrix = [1, 0, 0, 1, 0, 0];
+        break;
+      case "ET":
+        break;
+      case "Tf":
+        this.state.fontName = operands[0];
+        this.state.fontSize = Number(operands[1]) || this.state.fontSize;
+        break;
+      case "Tc":
+        this.state.charSpacing = Number(operands[0]) || 0;
+        break;
+      case "Tw":
+        this.state.wordSpacing = Number(operands[0]) || 0;
+        break;
+      case "Tz":
+        this.state.horizontalScale = (Number(operands[0]) || 100) / 100;
+        break;
+      case "TL":
+        this.state.leading = Number(operands[0]) || 0;
+        break;
+      case "Tr":
+        break;
+      case "Ts":
+        this.state.textRise = Number(operands[0]) || 0;
+        break;
+      case "Td":
+        this.moveText(Number(operands[0]) || 0, Number(operands[1]) || 0);
+        break;
+      case "TD": {
+        const leading = Number(operands[1]) || 0;
+        this.state.leading = -leading;
+        this.moveText(Number(operands[0]) || 0, leading);
+        break;
+      }
+      case "Tm":
+        this.state.textMatrix = operands.slice(0, 6).map(Number);
+        this.state.lineMatrix = this.state.textMatrix.slice();
+        break;
+      case "T*":
+        this.moveText(0, -this.state.leading || -this.state.fontSize * 1.2);
+        break;
+      case "Tj":
+        this.showText(operands.at(-1));
+        break;
+      case "'":
+        this.moveText(0, -this.state.leading || -this.state.fontSize * 1.2);
+        this.showText(operands.at(-1));
+        break;
+      case "\"":
+        this.state.wordSpacing = Number(operands[0]) || 0;
+        this.state.charSpacing = Number(operands[1]) || 0;
+        this.moveText(0, -this.state.leading || -this.state.fontSize * 1.2);
+        this.showText(operands.at(-1));
+        break;
+      case "TJ":
+        this.showTextArray(operands.at(-1));
+        break;
+      case "m":
+        this.pathMove(operands);
+        break;
+      case "l":
+        this.pathLine(operands);
+        break;
+      case "re":
+        this.pathRect(operands);
+        break;
+      case "h":
+        this.context.closePath();
+        break;
+      case "W":
+      case "W*":
+        break;
+      case "S":
+      case "s":
+        this.stroke();
+        break;
+      case "f":
+      case "F":
+      case "f*":
+        this.fill();
+        break;
+      case "B":
+      case "B*":
+        this.fill();
+        this.stroke();
+        break;
+      case "n":
+        this.context.beginPath();
+        break;
+      case "BDC":
+      case "BMC":
+      case "EMC":
+      case "MP":
+      case "DP":
+        break;
+      default:
+        this.unsupportedOperators.set(operator, (this.unsupportedOperators.get(operator) || 0) + 1);
+    }
+  }
+
+  moveText(x, y) {
+    const next = multiplyMatrix(this.state.lineMatrix, [1, 0, 0, 1, x, y]);
+    this.state.lineMatrix = next;
+    this.state.textMatrix = next.slice();
+  }
+
+  showTextArray(parts) {
+    if (!Array.isArray(parts)) {
+      return;
+    }
+    for (const part of parts) {
+      if (typeof part === "number") {
+        this.advanceText(-(part / 1000) * this.state.fontSize * this.state.horizontalScale);
+      } else {
+        this.showText(part);
+      }
+    }
+  }
+
+  showText(value) {
+    const text = this.decodeText(value);
+    if (!text) {
+      return;
+    }
+    const [x, y] = transformPoint(this.state.ctm, this.state.textMatrix[4], this.state.textMatrix[5]);
+    const fontSize = Math.abs(this.state.fontSize * this.state.ctm[3] * this.scale);
+    this.context.save();
+    this.context.fillStyle = this.state.fill;
+    this.context.font = canvasFontFor(this.currentFont(), fontSize);
+    this.context.scale(this.state.horizontalScale, 1);
+    this.context.fillText(text, (x * this.scale) / this.state.horizontalScale, (this.pageHeight - y - this.state.textRise) * this.scale);
+    const advance = this.context.measureText(text).width / this.scale;
+    this.context.restore();
+    this.advanceText(this.textAdvance(text, advance));
+  }
+
+  textAdvance(text, measuredWidth) {
+    const spaces = Array.from(text).filter((char) => char === " ").length;
+    return (measuredWidth + text.length * this.state.charSpacing + spaces * this.state.wordSpacing) * this.state.horizontalScale;
+  }
+
+  advanceText(amount) {
+    this.state.textMatrix = multiplyMatrix(this.state.textMatrix, [1, 0, 0, 1, amount, 0]);
+  }
+
+  decodeText(value) {
+    const bytes = textTokenToBytes(value);
+    const font = this.currentFont();
+    if (font?.toUnicode?.size) {
+      return decodeWithCMap(bytes, font.toUnicode);
+    }
+    return decodeWinAnsi(bytes);
+  }
+
+  currentFont() {
+    const ref = this.fonts[this.state.fontName];
+    if (!ref?.ref) {
+      return null;
+    }
+    return this.pdf.fonts.get(ref.ref);
+  }
+
+  pathMove(operands) {
+    const [x, y] = this.point(operands[0], operands[1]);
+    this.context.beginPath();
+    this.context.moveTo(x, y);
+  }
+
+  pathLine(operands) {
+    const [x, y] = this.point(operands[0], operands[1]);
+    this.context.lineTo(x, y);
+  }
+
+  pathRect(operands) {
+    const [x, y] = this.point(operands[0], operands[1]);
+    const width = Number(operands[2]) * this.scale;
+    const height = Number(operands[3]) * this.scale;
+    this.context.beginPath();
+    this.context.rect(x, y - height, width, height);
+  }
+
+  point(x, y) {
+    const point = transformPoint(this.state.ctm, Number(x) || 0, Number(y) || 0);
+    return [point[0] * this.scale, (this.pageHeight - point[1]) * this.scale];
+  }
+
+  stroke() {
+    this.context.save();
+    this.context.strokeStyle = this.state.stroke;
+    this.context.lineWidth = this.state.lineWidth * this.scale;
+    this.context.stroke();
+    this.context.restore();
+    this.context.beginPath();
+  }
+
+  fill() {
+    this.context.save();
+    this.context.fillStyle = this.state.fill;
+    this.context.fill();
+    this.context.restore();
+    this.context.beginPath();
+  }
+}
+
+class PdfValueParser {
+  constructor(source, position = 0) {
+    this.source = source;
+    this.position = position;
+  }
+
+  parseValue() {
+    this.skipWhitespace();
+    const char = this.source[this.position];
+    if (char === "<" && this.source[this.position + 1] === "<") {
+      return this.parseDictionary();
+    }
+    if (char === "[") {
+      return this.parseArray();
+    }
+    if (char === "/") {
+      return this.parseName();
+    }
+    if (char === "(") {
+      return this.parseString();
+    }
+    if (char === "<") {
+      return this.parseHexString();
+    }
+    return this.parseAtomOrReference();
+  }
+
+  parseDictionary() {
+    const dictionary = {};
+    this.position += 2;
+    while (this.position < this.source.length) {
+      this.skipWhitespace();
+      if (this.source[this.position] === ">" && this.source[this.position + 1] === ">") {
+        this.position += 2;
+        break;
+      }
+      const key = this.parseName();
+      dictionary[key] = this.parseValue();
+    }
+    return dictionary;
+  }
+
+  parseArray() {
+    const array = [];
+    this.position += 1;
+    while (this.position < this.source.length) {
+      this.skipWhitespace();
+      if (this.source[this.position] === "]") {
+        this.position += 1;
+        break;
+      }
+      array.push(this.parseValue());
+    }
+    return array;
+  }
+
+  parseName() {
+    this.position += 1;
+    const start = this.position;
+    while (this.position < this.source.length && !isPdfDelimiter(this.source.charCodeAt(this.position))) {
+      this.position += 1;
+    }
+    return decodePdfName(this.source.slice(start, this.position));
+  }
+
+  parseString() {
+    let depth = 1;
+    let value = "";
+    this.position += 1;
+    while (this.position < this.source.length && depth > 0) {
+      const char = this.source[this.position++];
+      if (char === "\\") {
+        value += this.parseStringEscape();
+      } else if (char === "(") {
+        depth += 1;
+        value += char;
+      } else if (char === ")") {
+        depth -= 1;
+        if (depth > 0) {
+          value += char;
+        }
+      } else {
+        value += char;
+      }
+    }
+    return { string: value };
+  }
+
+  parseStringEscape() {
+    const char = this.source[this.position++] || "";
+    if (/[0-7]/.test(char)) {
+      let octal = char;
+      for (let count = 0; count < 2 && /[0-7]/.test(this.source[this.position] || ""); count += 1) {
+        octal += this.source[this.position++];
+      }
+      return String.fromCharCode(parseInt(octal, 8) & 0xff);
+    }
+    if (char === "\r" && this.source[this.position] === "\n") {
+      this.position += 1;
+      return "";
+    }
+    if (char === "\n" || char === "\r") {
+      return "";
+    }
+    return decodeEscape(char);
+  }
+
+  parseHexString() {
+    this.position += 1;
+    const start = this.position;
+    const end = this.source.indexOf(">", start);
+    this.position = end >= 0 ? end + 1 : this.source.length;
+    return { hex: this.source.slice(start, end >= 0 ? end : this.source.length).replace(/\s+/g, "") };
+  }
+
+  parseAtomOrReference() {
+    const first = this.readAtom();
+    const firstNumber = Number(first);
+    const checkpoint = this.position;
+    this.skipWhitespace();
+    const second = this.readAtom();
+    const secondNumber = Number(second);
+    const afterSecond = this.position;
+    this.skipWhitespace();
+    if (Number.isFinite(firstNumber) && Number.isFinite(secondNumber) && this.source[this.position] === "R") {
+      this.position += 1;
+      return { ref: firstNumber, generation: secondNumber };
+    }
+    this.position = checkpoint;
+    if (first === "true") {
+      return true;
+    }
+    if (first === "false") {
+      return false;
+    }
+    if (first === "null") {
+      return null;
+    }
+    if (Number.isFinite(firstNumber)) {
+      return firstNumber;
+    }
+    this.position = afterSecond;
+    return first;
+  }
+
+  readAtom() {
+    this.skipWhitespace();
+    const start = this.position;
+    while (this.position < this.source.length && !isPdfDelimiter(this.source.charCodeAt(this.position))) {
+      this.position += 1;
+    }
+    return this.source.slice(start, this.position);
+  }
+
+  skipWhitespace() {
+    while (this.position < this.source.length) {
+      const code = this.source.charCodeAt(this.position);
+      if (WHITESPACE.has(code)) {
+        this.position += 1;
+      } else if (code === 37) {
+        while (this.position < this.source.length && ![10, 13].includes(this.source.charCodeAt(this.position))) {
+          this.position += 1;
+        }
+      } else {
+        break;
+      }
+    }
+  }
+}
+
+function parsePdfObject(raw) {
+  const parser = new PdfValueParser(raw);
+  return { value: parser.parseValue() };
+}
+
+function extractStream(source, bytes, objectStart, objectEnd, dictionary) {
+  const streamIndex = source.indexOf("stream", objectStart);
+  if (streamIndex < 0 || streamIndex > objectEnd || !dictionary || typeof dictionary !== "object") {
+    return null;
+  }
+  let dataStart = streamIndex + 6;
+  if (source[dataStart] === "\r" && source[dataStart + 1] === "\n") {
+    dataStart += 2;
+  } else if (source[dataStart] === "\n" || source[dataStart] === "\r") {
+    dataStart += 1;
+  }
+  const declaredLength = Number(dictionary.Length);
+  let dataEnd = Number.isFinite(declaredLength) && declaredLength > 0 ? dataStart + declaredLength : source.indexOf("endstream", dataStart);
+  if (dataEnd < 0 || dataEnd > objectEnd) {
+    return null;
+  }
+  if (!Number.isFinite(declaredLength) || declaredLength <= 0) {
+    while (dataEnd > dataStart && [10, 13].includes(bytes[dataEnd - 1])) {
+      dataEnd -= 1;
+    }
+  }
+  return { bytes: bytes.slice(dataStart, dataEnd) };
+}
+
+function tokenizeContent(source) {
+  const parser = new PdfValueParser(source);
+  const tokens = [];
+  while (parser.position < source.length) {
+    parser.skipWhitespace();
+    if (parser.position >= source.length) {
+      break;
+    }
+    const char = source[parser.position];
+    if (char === "/" || char === "[" || char === "(" || char === "<") {
+      tokens.push({ type: "value", value: parser.parseValue() });
+      continue;
+    }
+    const atom = parser.readAtom();
+    const number = Number(atom);
+    if (Number.isFinite(number)) {
+      tokens.push({ type: "value", value: number });
+    } else {
+      tokens.push({ type: "operator", value: atom });
+    }
+  }
+  return tokens;
+}
+
+async function inflate(bytes) {
+  if (!window.DecompressionStream) {
+    throw new Error("This browser does not expose DecompressionStream for FlateDecode");
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function bytesToBinaryString(bytes) {
+  const chunks = [];
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    chunks.push(String.fromCharCode(...bytes.subarray(index, index + 0x8000)));
+  }
+  return chunks.join("");
+}
+
+function isPdfDelimiter(code) {
+  return WHITESPACE.has(code) || DELIMITERS.has(code);
+}
+
+function decodePdfName(name) {
+  return name.replace(/#([0-9a-fA-F]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+}
+
+function decodeEscape(char) {
+  return ({ n: "\n", r: "\r", t: "\t", b: "\b", f: "\f" })[char] || char;
+}
+
+function normalizeFilters(filter) {
+  if (!filter) {
+    return [];
+  }
+  return Array.isArray(filter) ? filter : [filter];
+}
+
+function recordFilter(filters, value) {
+  for (const filter of normalizeFilters(value?.Filter)) {
+    filters.set(filter, (filters.get(filter) || 0) + 1);
+  }
+}
+
+function resolvePrimitive(pdf, value) {
+  return pdf.resolve(value);
+}
+
+function numericArray(value) {
+  return Array.isArray(value) && value.every((item) => typeof item === "number") ? value : null;
+}
+
+function parseToUnicodeCMap(source) {
+  const map = new Map();
+  const bfcharPattern = /beginbfchar([\s\S]*?)endbfchar/g;
+  let match;
+  while ((match = bfcharPattern.exec(source))) {
+    const pairs = Array.from(match[1].matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g));
+    for (const pair of pairs) {
+      map.set(pair[1].toUpperCase(), hexToUnicode(pair[2]));
+    }
+  }
+  const bfrangePattern = /beginbfrange([\s\S]*?)endbfrange/g;
+  while ((match = bfrangePattern.exec(source))) {
+    const ranges = Array.from(match[1].matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g));
+    for (const range of ranges) {
+      const start = parseInt(range[1], 16);
+      const end = parseInt(range[2], 16);
+      const target = parseInt(range[3], 16);
+      const width = range[1].length;
+      for (let code = start; code <= end && code - start < 512; code += 1) {
+        map.set(code.toString(16).toUpperCase().padStart(width, "0"), String.fromCodePoint(target + code - start));
+      }
+    }
+    const arrayRanges = Array.from(match[1].matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*\[([^\]]+)\]/g));
+    for (const range of arrayRanges) {
+      const start = parseInt(range[1], 16);
+      const end = parseInt(range[2], 16);
+      const width = range[1].length;
+      const targets = Array.from(range[3].matchAll(/<([0-9a-fA-F]+)>/g)).map((target) => target[1]);
+      for (let offset = 0; offset < targets.length && start + offset <= end; offset += 1) {
+        map.set((start + offset).toString(16).toUpperCase().padStart(width, "0"), hexToUnicode(targets[offset]));
+      }
+    }
+  }
+  return map;
+}
+
+function hexToUnicode(hex) {
+  const chars = [];
+  for (let index = 0; index < hex.length; index += 4) {
+    chars.push(String.fromCodePoint(parseInt(hex.slice(index, index + 4), 16)));
+  }
+  return chars.join("");
+}
+
+function textTokenToBytes(value) {
+  if (value?.hex) {
+    const hex = value.hex.length % 2 ? `${value.hex}0` : value.hex;
+    const bytes = [];
+    for (let index = 0; index < hex.length; index += 2) {
+      bytes.push(parseInt(hex.slice(index, index + 2), 16));
+    }
+    return bytes;
+  }
+  if (value?.string) {
+    return Array.from(value.string).map((char) => char.charCodeAt(0) & 0xff);
+  }
+  return [];
+}
+
+function decodeWithCMap(bytes, cmap) {
+  const hex = bytes.map((byte) => byte.toString(16).toUpperCase().padStart(2, "0")).join("");
+  const widths = Array.from(new Set(Array.from(cmap.keys()).map((key) => key.length))).sort((left, right) => right - left);
+  let output = "";
+  let index = 0;
+  while (index < hex.length) {
+    let matched = false;
+    for (const width of widths) {
+      const key = hex.slice(index, index + width);
+      if (cmap.has(key)) {
+        output += cmap.get(key);
+        index += width;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      output += decodeWinAnsi([parseInt(hex.slice(index, index + 2), 16)]);
+      index += 2;
+    }
+  }
+  return output;
+}
+
+function decodeWinAnsi(bytes) {
+  return bytes.map((byte) => WIN_ANSI.get(byte) || String.fromCharCode(byte)).join("");
+}
+
+function multiplyMatrix(left, right) {
+  return [
+    left[0] * right[0] + left[2] * right[1],
+    left[1] * right[0] + left[3] * right[1],
+    left[0] * right[2] + left[2] * right[3],
+    left[1] * right[2] + left[3] * right[3],
+    left[0] * right[4] + left[2] * right[5] + left[4],
+    left[1] * right[4] + left[3] * right[5] + left[5],
+  ];
+}
+
+function transformPoint(matrix, x, y) {
+  return [matrix[0] * x + matrix[2] * y + matrix[4], matrix[1] * x + matrix[3] * y + matrix[5]];
+}
+
+function colorFromOperands(operator, operands) {
+  if (operator === "g" || operator === "G") {
+    const value = Math.round((Number(operands[0]) || 0) * 255);
+    return `rgb(${value}, ${value}, ${value})`;
+  }
+  const [red, green, blue] = operands.slice(-3).map((value) => Math.round((Number(value) || 0) * 255));
+  return `rgb(${red}, ${green}, ${blue})`;
+}
+
+function canvasFontFor(font, fontSize) {
+  return `${fontStyleFor(font)} ${fontWeightFor(font)} ${fontSize}px ${fontFamilyFor(font)}`;
+}
+
+function fontStyleFor(font) {
+  const base = normalizedFontName(font);
+  return base.includes("italic") || base.includes("oblique") ? "italic" : "normal";
+}
+
+function fontWeightFor(font) {
+  const base = normalizedFontName(font);
+  if (base.includes("black") || base.includes("heavy")) {
+    return "900";
+  }
+  if (base.includes("bold") || base.includes("semibold") || base.includes("demibold")) {
+    return "700";
+  }
+  return "400";
+}
+
+function fontFamilyFor(font) {
+  const base = normalizedFontName(font);
+  if (base.includes("courier") || base.includes("mono")) {
+    return "ui-monospace, monospace";
+  }
+  if (base.includes("times") || base.includes("serif")) {
+    return "Times New Roman, serif";
+  }
+  return "Arial, sans-serif";
+}
+
+function normalizedFontName(font) {
+  const base = String(font?.baseFont || "").toLowerCase();
+  return base.replace(/^[a-z]{6}\+/, "").replace(/[,_-]/g, "");
+}

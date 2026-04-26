@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# Third-party and local/copyrighted sample corpora
+vendor/
+pdf-files/
+
+# Local editor/runtime noise
+.vscode/
+*.log

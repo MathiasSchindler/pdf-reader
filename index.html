@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PDF Reader</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">Dependency-free PDF experiment</p>
+        <h1>PDF Reader</h1>
+      </div>
+      <div class="controls">
+        <label>
+          <span>Document</span>
+          <select id="document-select"></select>
+        </label>
+        <label>
+          <span>Scale</span>
+          <input id="scale-input" type="range" min="0.55" max="1.6" value="0.9" step="0.05">
+        </label>
+        <button id="render-button" type="button">Render</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="inspector">
+        <section>
+          <h2>Status</h2>
+          <div id="status" class="status">Idle</div>
+        </section>
+        <section>
+          <h2>Document</h2>
+          <pre id="document-output"></pre>
+        </section>
+        <section>
+          <h2>Renderer Audit</h2>
+          <pre id="audit-output"></pre>
+        </section>
+        <section>
+          <h2>Unsupported Operators</h2>
+          <pre id="operator-output"></pre>
+        </section>
+      </aside>
+
+      <section class="viewer" aria-label="Rendered PDF pages">
+        <div id="page-stack" class="page-stack"></div>
+      </section>
+    </main>
+
+    <script type="module" src="./src/reader-app.js"></script>
+  </body>
+</html>
