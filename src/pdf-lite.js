@@ -68,8 +68,12 @@ class PdfLiteDocument {
     }
     const scale = options.scale || 1;
     const mediaBox = page.mediaBox || [0, 0, 595, 842];
-    const width = Math.abs(mediaBox[2] - mediaBox[0]);
-    const height = Math.abs(mediaBox[3] - mediaBox[1]);
+    const pageBox = page.cropBox || mediaBox;
+    const boxWidth = Math.abs(pageBox[2] - pageBox[0]);
+    const boxHeight = Math.abs(pageBox[3] - pageBox[1]);
+    const rotation = normalizeRotation(page.rotate);
+    const width = rotation === 90 || rotation === 270 ? boxHeight : boxWidth;
+    const height = rotation === 90 || rotation === 270 ? boxWidth : boxHeight;
     const pixelRatio = window.devicePixelRatio || 1;
     canvas.width = Math.floor(width * scale * pixelRatio);
     canvas.height = Math.floor(height * scale * pixelRatio);
@@ -79,7 +83,7 @@ class PdfLiteDocument {
     context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
     context.fillStyle = "#fff";
     context.fillRect(0, 0, width * scale, height * scale);
-    const renderer = new ContentRenderer(this, page, context, { scale, width, height });
+    const renderer = new ContentRenderer(this, page, context, { scale, width, height, boxWidth, boxHeight, rotation, originX: pageBox[0], originY: pageBox[1] });
     const streams = await this.getPageContentStreams(page);
     await renderer.interpret(streams.map((stream) => bytesToBinaryString(stream)).join("\n"));
     return { unsupportedOperators: renderer.unsupportedOperators };
@@ -151,12 +155,16 @@ class PdfLiteDocument {
     const nextInherited = {
       resources: this.resolve(node.Resources) || inherited.resources,
       mediaBox: numericArray(this.resolve(node.MediaBox)) || inherited.mediaBox,
+      cropBox: numericArray(this.resolve(node.CropBox)) || inherited.cropBox,
+      rotate: normalizeRotation(this.resolve(node.Rotate) ?? inherited.rotate ?? 0),
     };
     if (node.Type === "Page") {
       this.pages.push({
         object: node,
         resources: nextInherited.resources,
         mediaBox: nextInherited.mediaBox || [0, 0, 595, 842],
+        cropBox: nextInherited.cropBox,
+        rotate: nextInherited.rotate,
         contents: node.Contents,
       });
       return;
@@ -220,6 +228,12 @@ class PdfLiteDocument {
     for (const filter of filters) {
       if (filter === "FlateDecode" || filter === "Fl") {
         output = await inflate(output);
+      } else if (filter === "ASCIIHexDecode" || filter === "AHx") {
+        output = decodeAsciiHex(output);
+      } else if (filter === "ASCII85Decode" || filter === "A85") {
+        output = decodeAscii85(output);
+      } else if (filter === "RunLengthDecode" || filter === "RL") {
+        output = decodeRunLength(output);
       } else {
         throw new Error(`Unsupported stream filter ${filter}`);
       }
@@ -250,6 +264,11 @@ class ContentRenderer {
     this.scale = metrics.scale;
     this.pageWidth = metrics.width;
     this.pageHeight = metrics.height;
+    this.pageBoxWidth = metrics.boxWidth || metrics.width;
+    this.pageBoxHeight = metrics.boxHeight || metrics.height;
+    this.rotation = metrics.rotation || 0;
+    this.originX = metrics.originX || 0;
+    this.originY = metrics.originY || 0;
     this.stack = [];
     this.state = this.defaultState();
     this.unsupportedOperators = new Map();
@@ -271,6 +290,8 @@ class ContentRenderer {
       lineDash: [],
       lineDashOffset: 0,
       miterLimit: 10,
+      lineCap: "butt",
+      lineJoin: "miter",
       currentPoint: null,
       fontName: null,
       fontSize: 10,
@@ -278,6 +299,7 @@ class ContentRenderer {
       wordSpacing: 0,
       horizontalScale: 1,
       leading: 0,
+      textRenderingMode: 0,
       textRise: 0,
       textMatrix: [1, 0, 0, 1, 0, 0],
       lineMatrix: [1, 0, 0, 1, 0, 0],
@@ -300,9 +322,11 @@ class ContentRenderer {
     switch (operator) {
       case "q":
         this.stack.push(structuredClone(this.state));
+        this.context.save();
         break;
       case "Q":
         this.state = this.stack.pop() || this.defaultState();
+        this.context.restore();
         break;
       case "cm":
         this.state.ctm = multiplyMatrix(this.state.ctm, operands.slice(-6).map(Number));
@@ -318,10 +342,10 @@ class ContentRenderer {
         this.state.lineDashOffset = Number(operands[1]) || 0;
         break;
       case "J":
-        this.context.lineCap = ["butt", "round", "square"][Number(operands.at(-1))] || "butt";
+        this.state.lineCap = ["butt", "round", "square"][Number(operands.at(-1))] || "butt";
         break;
       case "j":
-        this.context.lineJoin = ["miter", "round", "bevel"][Number(operands.at(-1))] || "miter";
+        this.state.lineJoin = ["miter", "round", "bevel"][Number(operands.at(-1))] || "miter";
         break;
       case "rg":
       case "g":
@@ -374,6 +398,7 @@ class ContentRenderer {
         this.state.leading = Number(operands[0]) || 0;
         break;
       case "Tr":
+        this.state.textRenderingMode = Number(operands[0]) || 0;
         break;
       case "Ts":
         this.state.textRise = Number(operands[0]) || 0;
@@ -435,24 +460,46 @@ class ContentRenderer {
         this.context.closePath();
         break;
       case "W":
+        this.clip("nonzero");
+        break;
       case "W*":
+        this.clip("evenodd");
         break;
       case "S":
+        this.stroke();
+        break;
       case "s":
+        this.context.closePath();
         this.stroke();
         break;
       case "f":
       case "F":
-      case "f*":
         this.fill();
         break;
+      case "f*":
+        this.fill("evenodd");
+        break;
       case "B":
-      case "B*":
         this.fill();
+        this.stroke();
+        break;
+      case "B*":
+        this.fill("evenodd");
+        this.stroke();
+        break;
+      case "b":
+        this.context.closePath();
+        this.fill();
+        this.stroke();
+        break;
+      case "b*":
+        this.context.closePath();
+        this.fill("evenodd");
         this.stroke();
         break;
       case "n":
         this.context.beginPath();
+        this.state.currentPoint = null;
         break;
       case "BDC":
       case "BMC":
@@ -494,12 +541,36 @@ class ContentRenderer {
     this.context.save();
     this.context.fillStyle = this.state.fill;
     this.context.globalAlpha = this.state.fillAlpha;
+    this.context.strokeStyle = this.state.stroke;
+    this.context.lineWidth = this.state.lineWidth * this.scale;
+    this.context.lineCap = this.state.lineCap;
+    this.context.lineJoin = this.state.lineJoin;
     this.context.font = canvasFontFor(this.currentFont(), fontSize);
+    const [canvasX, canvasY] = this.pagePoint(x, y + this.state.textRise);
+    this.context.translate(canvasX, canvasY);
+    this.context.rotate((this.rotation * Math.PI) / 180);
     this.context.scale(this.state.horizontalScale, 1);
-    this.context.fillText(text, (x * this.scale) / this.state.horizontalScale, (this.pageHeight - y - this.state.textRise) * this.scale);
+    this.paintText(text, 0, 0);
     const advance = this.context.measureText(text).width / this.scale;
     this.context.restore();
     this.advanceText(this.textAdvance(text, advance));
+  }
+
+  paintText(text, x, y) {
+    const mode = this.state.textRenderingMode;
+    const paintMode = mode >= 4 ? mode - 4 : mode;
+    if (mode >= 4) {
+      this.unsupported("Tr/TextClip");
+    }
+    if (paintMode === 0 || paintMode === 2) {
+      this.context.fillText(text, x, y);
+    }
+    if (paintMode === 1 || paintMode === 2) {
+      const previousAlpha = this.context.globalAlpha;
+      this.context.globalAlpha = this.state.strokeAlpha;
+      this.context.strokeText(text, x, y);
+      this.context.globalAlpha = previousAlpha;
+    }
   }
 
   textAdvance(text, measuredWidth) {
@@ -550,10 +621,10 @@ class ContentRenderer {
       this.state.lineWidth = graphicsState.LW;
     }
     if (typeof graphicsState.LC === "number") {
-      this.context.lineCap = ["butt", "round", "square"][graphicsState.LC] || "butt";
+      this.state.lineCap = ["butt", "round", "square"][graphicsState.LC] || "butt";
     }
     if (typeof graphicsState.LJ === "number") {
-      this.context.lineJoin = ["miter", "round", "bevel"][graphicsState.LJ] || "miter";
+      this.state.lineJoin = ["miter", "round", "bevel"][graphicsState.LJ] || "miter";
     }
     if (typeof graphicsState.ML === "number") {
       this.state.miterLimit = graphicsState.ML;
@@ -621,11 +692,11 @@ class ContentRenderer {
         image.close?.();
         return;
       }
-      if (filters.length <= 1 && (!filters.length || ["FlateDecode", "Fl"].includes(filters[0]))) {
+      if (filters.every(isDataImageFilter)) {
         const imageData = await this.imageDataForXObject(object);
         if (imageData) {
           const image = await createImageBitmap(imageData);
-          this.drawUnitImage(image);
+          this.drawUnitImage(image, { smoothing: !isIndexedColorSpace(this.pdf.resolve(object.value.ColorSpace)) });
           image.close?.();
           return;
         }
@@ -636,10 +707,14 @@ class ContentRenderer {
     }
   }
 
-  drawUnitImage(image) {
+  drawUnitImage(image, options = {}) {
     const [a, b, c, d, e, f] = this.state.ctm;
+    const [canvasX, canvasY] = this.pagePoint(e, f);
+    const [xA, xB] = this.pageVector(a, b);
+    const [yA, yB] = this.pageVector(c, d);
     this.context.save();
-    this.context.transform(a * this.scale, -b * this.scale, c * this.scale, -d * this.scale, e * this.scale, (this.pageHeight - f) * this.scale);
+    this.context.imageSmoothingEnabled = options.smoothing !== false;
+    this.context.transform(xA, xB, yA, yB, canvasX, canvasY);
     this.context.transform(1, 0, 0, -1, 0, 1);
     this.context.drawImage(image, 0, 0, 1, 1);
     this.context.restore();
@@ -650,11 +725,30 @@ class ContentRenderer {
     const width = Number(this.pdf.resolve(dictionary.Width));
     const height = Number(this.pdf.resolve(dictionary.Height));
     const bits = Number(this.pdf.resolve(dictionary.BitsPerComponent));
-    if (!Number.isFinite(width) || !Number.isFinite(height) || bits !== 8) {
+    if (!Number.isFinite(width) || !Number.isFinite(height) || !Number.isFinite(bits)) {
       return null;
     }
-    const pixels = await this.pdf.decodeStream(object.stream.bytes, dictionary);
-    const components = imageComponents(this.pdf.resolve(dictionary.ColorSpace), pixels.length, width, height);
+    const colorSpace = this.pdf.resolve(dictionary.ColorSpace);
+    const palette = await indexedColorPalette(this.pdf, colorSpace);
+    if (palette) {
+      const pixels = unpackIndexedSamples(applyImageDecodeParms(await this.pdf.decodeStream(object.stream.bytes, dictionary), dictionary, width, height), bits, width, height, dictionary.Decode);
+      const alpha = await this.imageAlphaForXObject(dictionary, width, height);
+      const imageData = new ImageData(width, height);
+      for (let pixelIndex = 0; pixelIndex < width * height; pixelIndex += 1) {
+        const color = palette.colors[pixels[pixelIndex]] || palette.colors[0] || [0, 0, 0];
+        const targetIndex = pixelIndex * 4;
+        imageData.data[targetIndex] = color[0];
+        imageData.data[targetIndex + 1] = color[1];
+        imageData.data[targetIndex + 2] = color[2];
+        imageData.data[targetIndex + 3] = alpha?.[pixelIndex] ?? 255;
+      }
+      return imageData;
+    }
+    if (bits !== 8) {
+      return null;
+    }
+    const pixels = applyImageDecodeParms(await this.pdf.decodeStream(object.stream.bytes, dictionary), dictionary, width, height);
+    const components = imageComponents(colorSpace, pixels.length, width, height);
     if (![1, 3, 4].includes(components)) {
       return null;
     }
@@ -667,20 +761,21 @@ class ContentRenderer {
     for (let pixelIndex = 0; pixelIndex < width * height; pixelIndex += 1) {
       const sourceIndex = pixelIndex * components;
       const targetIndex = pixelIndex * 4;
+      const decoded = decodeImageComponents(pixels, sourceIndex, components, dictionary.Decode);
       if (components === 1) {
-        const gray = pixels[sourceIndex];
+        const gray = decoded[0];
         imageData.data[targetIndex] = gray;
         imageData.data[targetIndex + 1] = gray;
         imageData.data[targetIndex + 2] = gray;
       } else if (components === 4) {
-        const [red, green, blue] = cmykToRgb(pixels[sourceIndex], pixels[sourceIndex + 1], pixels[sourceIndex + 2], pixels[sourceIndex + 3]);
+        const [red, green, blue] = cmykToRgb(decoded[0], decoded[1], decoded[2], decoded[3]);
         imageData.data[targetIndex] = red;
         imageData.data[targetIndex + 1] = green;
         imageData.data[targetIndex + 2] = blue;
       } else {
-        imageData.data[targetIndex] = pixels[sourceIndex];
-        imageData.data[targetIndex + 1] = pixels[sourceIndex + 1];
-        imageData.data[targetIndex + 2] = pixels[sourceIndex + 2];
+        imageData.data[targetIndex] = decoded[0];
+        imageData.data[targetIndex + 1] = decoded[1];
+        imageData.data[targetIndex + 2] = decoded[2];
       }
       imageData.data[targetIndex + 3] = alpha?.[pixelIndex] ?? 255;
     }
@@ -700,10 +795,10 @@ class ContentRenderer {
       return null;
     }
     const filters = normalizeFilters(this.pdf.resolve(mask.Filter));
-    if (filters.length > 1 || (filters.length === 1 && !["FlateDecode", "Fl"].includes(filters[0]))) {
+    if (!filters.every(isDataImageFilter)) {
       return null;
     }
-    const pixels = await this.pdf.decodeStream(maskObject.stream.bytes, mask);
+    const pixels = applyImageDecodeParms(await this.pdf.decodeStream(maskObject.stream.bytes, mask), mask, width, height);
     const components = imageComponents(this.pdf.resolve(mask.ColorSpace), pixels.length, width, height);
     if (components !== 1 || pixels.length < width * height) {
       return null;
@@ -752,17 +847,58 @@ class ContentRenderer {
   }
 
   pathRect(operands) {
-    const [x, y] = this.point(operands[0], operands[1]);
-    const width = Number(operands[2]) * this.scale;
-    const height = Number(operands[3]) * this.scale;
+    const x = Number(operands[0]) || 0;
+    const y = Number(operands[1]) || 0;
+    const width = Number(operands[2]) || 0;
+    const height = Number(operands[3]) || 0;
+    const [x1, y1] = this.point(x, y);
+    const [x2, y2] = this.point(x + width, y);
+    const [x3, y3] = this.point(x + width, y + height);
+    const [x4, y4] = this.point(x, y + height);
     this.context.beginPath();
-    this.context.rect(x, y - height, width, height);
+    this.context.moveTo(x1, y1);
+    this.context.lineTo(x2, y2);
+    this.context.lineTo(x3, y3);
+    this.context.lineTo(x4, y4);
+    this.context.closePath();
     this.state.currentPoint = null;
   }
 
   point(x, y) {
     const point = transformPoint(this.state.ctm, Number(x) || 0, Number(y) || 0);
-    return [point[0] * this.scale, (this.pageHeight - point[1]) * this.scale];
+    return this.pagePoint(point[0], point[1]);
+  }
+
+  pagePoint(x, y) {
+    const relativeX = x - this.originX;
+    const relativeY = y - this.originY;
+    if (this.rotation === 90) {
+      return [relativeY * this.scale, relativeX * this.scale];
+    }
+    if (this.rotation === 180) {
+      return [(this.pageBoxWidth - relativeX) * this.scale, relativeY * this.scale];
+    }
+    if (this.rotation === 270) {
+      return [(this.pageBoxHeight - relativeY) * this.scale, (this.pageBoxWidth - relativeX) * this.scale];
+    }
+    return [relativeX * this.scale, (this.pageBoxHeight - relativeY) * this.scale];
+  }
+
+  pageVector(x, y) {
+    if (this.rotation === 90) {
+      return [y * this.scale, x * this.scale];
+    }
+    if (this.rotation === 180) {
+      return [-x * this.scale, y * this.scale];
+    }
+    if (this.rotation === 270) {
+      return [-y * this.scale, -x * this.scale];
+    }
+    return [x * this.scale, -y * this.scale];
+  }
+
+  clip(rule) {
+    this.context.clip(rule);
   }
 
   stroke() {
@@ -771,6 +907,8 @@ class ContentRenderer {
     this.context.globalAlpha = this.state.strokeAlpha;
     this.context.lineWidth = this.state.lineWidth * this.scale;
     this.context.miterLimit = this.state.miterLimit;
+    this.context.lineCap = this.state.lineCap;
+    this.context.lineJoin = this.state.lineJoin;
     this.context.setLineDash(this.state.lineDash.map((value) => value * this.scale));
     this.context.lineDashOffset = this.state.lineDashOffset * this.scale;
     this.context.stroke();
@@ -779,11 +917,11 @@ class ContentRenderer {
     this.state.currentPoint = null;
   }
 
-  fill() {
+  fill(rule = "nonzero") {
     this.context.save();
     this.context.fillStyle = this.state.fill;
     this.context.globalAlpha = this.state.fillAlpha;
-    this.context.fill();
+    this.context.fill(rule);
     this.context.restore();
     this.context.beginPath();
     this.state.currentPoint = null;
@@ -1021,6 +1159,79 @@ async function inflate(bytes) {
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
+function decodeAsciiHex(bytes) {
+  const source = bytesToBinaryString(bytes).replace(/\s+/g, "");
+  const hex = source.replace(/>.*/, "");
+  const padded = hex.length % 2 ? `${hex}0` : hex;
+  const output = new Uint8Array(padded.length / 2);
+  for (let index = 0; index < padded.length; index += 2) {
+    output[index / 2] = parseInt(padded.slice(index, index + 2), 16) || 0;
+  }
+  return output;
+}
+
+function decodeAscii85(bytes) {
+  const source = bytesToBinaryString(bytes).replace(/\s+/g, "").replace(/^<~/, "").replace(/~>$/, "");
+  const output = [];
+  let group = [];
+  for (const char of source) {
+    if (char === "z" && !group.length) {
+      output.push(0, 0, 0, 0);
+      continue;
+    }
+    const code = char.charCodeAt(0);
+    if (code < 33 || code > 117) {
+      continue;
+    }
+    group.push(code - 33);
+    if (group.length === 5) {
+      appendAscii85Group(output, group, 4);
+      group = [];
+    }
+  }
+  if (group.length) {
+    const outputBytes = group.length - 1;
+    while (group.length < 5) {
+      group.push(84);
+    }
+    appendAscii85Group(output, group, outputBytes);
+  }
+  return new Uint8Array(output);
+}
+
+function appendAscii85Group(output, group, byteCount) {
+  let value = 0;
+  for (const digit of group) {
+    value = value * 85 + digit;
+  }
+  output.push((value >>> 24) & 0xff);
+  if (byteCount > 1) output.push((value >>> 16) & 0xff);
+  if (byteCount > 2) output.push((value >>> 8) & 0xff);
+  if (byteCount > 3) output.push(value & 0xff);
+}
+
+function decodeRunLength(bytes) {
+  const output = [];
+  for (let index = 0; index < bytes.length;) {
+    const length = bytes[index++];
+    if (length === 128) {
+      break;
+    }
+    if (length <= 127) {
+      const count = length + 1;
+      output.push(...bytes.slice(index, index + count));
+      index += count;
+    } else {
+      const count = 257 - length;
+      const value = bytes[index++];
+      for (let repeat = 0; repeat < count; repeat += 1) {
+        output.push(value);
+      }
+    }
+  }
+  return new Uint8Array(output);
+}
+
 function bytesToBinaryString(bytes) {
   const chunks = [];
   for (let index = 0; index < bytes.length; index += 0x8000) {
@@ -1048,6 +1259,10 @@ function normalizeFilters(filter) {
   return Array.isArray(filter) ? filter : [filter];
 }
 
+function isDataImageFilter(filter) {
+  return ["FlateDecode", "Fl", "ASCIIHexDecode", "AHx", "ASCII85Decode", "A85", "RunLengthDecode", "RL"].includes(filter);
+}
+
 function recordFilter(filters, value) {
   for (const filter of normalizeFilters(value?.Filter)) {
     filters.set(filter, (filters.get(filter) || 0) + 1);
@@ -1060,6 +1275,114 @@ function resolvePrimitive(pdf, value) {
 
 function numericArray(value) {
   return Array.isArray(value) && value.every((item) => typeof item === "number") ? value : null;
+}
+
+function normalizeRotation(value) {
+  const rotation = Number(value) || 0;
+  return ((rotation % 360) + 360) % 360;
+}
+
+async function indexedColorPalette(pdf, colorSpace) {
+  if (!isIndexedColorSpace(colorSpace)) {
+    return null;
+  }
+  const baseColorSpace = pdf.resolve(colorSpace[1]);
+  const highValue = Number(pdf.resolve(colorSpace[2]));
+  const lookup = colorSpace[3];
+  const componentCount = paletteComponentCount(baseColorSpace);
+  if (!Number.isFinite(highValue) || componentCount < 1) {
+    return null;
+  }
+  const lookupBytes = await lookupBytesFor(pdf, lookup);
+  if (!lookupBytes.length) {
+    return null;
+  }
+  const colors = [];
+  for (let index = 0; index <= highValue; index += 1) {
+    const offset = index * componentCount;
+    const components = Array.from(lookupBytes.slice(offset, offset + componentCount));
+    colors.push(rgbFromPaletteComponents(baseColorSpace, components));
+  }
+  return { colors };
+}
+
+function isIndexedColorSpace(colorSpace) {
+  return Array.isArray(colorSpace) && ["Indexed", "I"].includes(colorSpace[0]);
+}
+
+function paletteComponentCount(colorSpace) {
+  const name = Array.isArray(colorSpace) ? colorSpace[0] : colorSpace;
+  if (name === "DeviceGray") {
+    return 1;
+  }
+  if (name === "DeviceRGB") {
+    return 3;
+  }
+  if (name === "DeviceCMYK") {
+    return 4;
+  }
+  if (name === "ICCBased") {
+    const components = Number(colorSpace?.[1]?.N);
+    return [1, 3, 4].includes(components) ? components : 0;
+  }
+  return 0;
+}
+
+async function lookupBytesFor(pdf, lookup) {
+  const resolved = pdf.resolve(lookup);
+  if (resolved?.hex) {
+    return hexStringToBytes(resolved.hex);
+  }
+  if (resolved?.string) {
+    return new Uint8Array(textTokenToBytes(resolved));
+  }
+  const object = pdf.objectFor(lookup);
+  if (object?.stream) {
+    return pdf.decodeStream(object.stream.bytes, object.value);
+  }
+  return new Uint8Array();
+}
+
+function rgbFromPaletteComponents(colorSpace, components) {
+  const name = Array.isArray(colorSpace) ? colorSpace[0] : colorSpace;
+  if (name === "DeviceGray") {
+    const gray = components[0] || 0;
+    return [gray, gray, gray];
+  }
+  if (name === "DeviceCMYK") {
+    return cmykToRgb(components[0] || 0, components[1] || 0, components[2] || 0, components[3] || 0);
+  }
+  return [components[0] || 0, components[1] || 0, components[2] || 0];
+}
+
+function unpackIndexedSamples(bytes, bits, width, height, decode) {
+  const sampleCount = width * height;
+  const output = new Uint8Array(sampleCount);
+  if (bits === 8) {
+    output.set(bytes.slice(0, sampleCount));
+    return applyIndexedDecode(output, decode, bits);
+  }
+  if (![1, 2, 4].includes(bits)) {
+    return output;
+  }
+  const mask = (1 << bits) - 1;
+  let outputIndex = 0;
+  for (const byte of bytes) {
+    for (let shift = 8 - bits; shift >= 0 && outputIndex < sampleCount; shift -= bits) {
+      output[outputIndex++] = (byte >> shift) & mask;
+    }
+  }
+  return applyIndexedDecode(output, decode, bits);
+}
+
+function applyIndexedDecode(samples, decode, bits) {
+  if (!Array.isArray(decode) || typeof decode[0] !== "number" || typeof decode[1] !== "number") {
+    return samples;
+  }
+  const maxSample = (1 << bits) - 1;
+  const low = decode[0];
+  const high = decode[1];
+  return samples.map((sample) => Math.round(low + (sample / maxSample) * (high - low)));
 }
 
 function imageComponents(colorSpace, byteLength, width, height) {
@@ -1094,6 +1417,106 @@ function cmykToRgb(cyanByte, magentaByte, yellowByte, blackByte) {
     Math.round(255 * (1 - magenta) * (1 - black)),
     Math.round(255 * (1 - yellow) * (1 - black)),
   ];
+}
+
+function applyImageDecodeParms(bytes, dictionary, width, height) {
+  const params = imageDecodeParms(dictionary);
+  const predictor = Number(params?.Predictor) || 1;
+  if (predictor <= 1) {
+    return bytes;
+  }
+  const colors = Number(params.Colors) || imageComponents(dictionary.ColorSpace, bytes.length, width, height) || 1;
+  const bits = Number(params.BitsPerComponent) || Number(dictionary.BitsPerComponent) || 8;
+  const columns = Number(params.Columns) || width;
+  if (bits !== 8 || colors < 1 || columns < 1) {
+    return bytes;
+  }
+  if (predictor === 2) {
+    return applyTiffPredictor(bytes, colors, columns, height);
+  }
+  if (predictor >= 10 && predictor <= 15) {
+    return applyPngPredictor(bytes, colors, columns, height);
+  }
+  return bytes;
+}
+
+function imageDecodeParms(dictionary) {
+  const params = dictionary.DecodeParms || dictionary.DP;
+  return Array.isArray(params) ? params[0] : params;
+}
+
+function applyTiffPredictor(bytes, colors, columns, rows) {
+  const rowLength = colors * columns;
+  const output = new Uint8Array(bytes);
+  for (let row = 0; row < rows; row += 1) {
+    const rowStart = row * rowLength;
+    for (let index = colors; index < rowLength; index += 1) {
+      output[rowStart + index] = (output[rowStart + index] + output[rowStart + index - colors]) & 0xff;
+    }
+  }
+  return output;
+}
+
+function applyPngPredictor(bytes, colors, columns, rows) {
+  const rowLength = colors * columns;
+  const output = new Uint8Array(rowLength * rows);
+  let inputOffset = 0;
+  let outputOffset = 0;
+  for (let row = 0; row < rows && inputOffset < bytes.length; row += 1) {
+    const filter = bytes[inputOffset++];
+    for (let index = 0; index < rowLength && inputOffset < bytes.length; index += 1) {
+      const raw = bytes[inputOffset++];
+      const left = index >= colors ? output[outputOffset + index - colors] : 0;
+      const up = row > 0 ? output[outputOffset + index - rowLength] : 0;
+      const upperLeft = row > 0 && index >= colors ? output[outputOffset + index - rowLength - colors] : 0;
+      output[outputOffset + index] = (raw + pngPredictorValue(filter, left, up, upperLeft)) & 0xff;
+    }
+    outputOffset += rowLength;
+  }
+  return output;
+}
+
+function pngPredictorValue(filter, left, up, upperLeft) {
+  if (filter === 1) {
+    return left;
+  }
+  if (filter === 2) {
+    return up;
+  }
+  if (filter === 3) {
+    return Math.floor((left + up) / 2);
+  }
+  if (filter === 4) {
+    return paethPredictor(left, up, upperLeft);
+  }
+  return 0;
+}
+
+function paethPredictor(left, up, upperLeft) {
+  const estimate = left + up - upperLeft;
+  const leftDistance = Math.abs(estimate - left);
+  const upDistance = Math.abs(estimate - up);
+  const upperLeftDistance = Math.abs(estimate - upperLeft);
+  if (leftDistance <= upDistance && leftDistance <= upperLeftDistance) {
+    return left;
+  }
+  return upDistance <= upperLeftDistance ? up : upperLeft;
+}
+
+function decodeImageComponents(bytes, sourceIndex, components, decode) {
+  const values = [];
+  for (let index = 0; index < components; index += 1) {
+    const value = bytes[sourceIndex + index] || 0;
+    values.push(decodeImageComponent(value, decode?.[index * 2], decode?.[index * 2 + 1]));
+  }
+  return values;
+}
+
+function decodeImageComponent(value, low, high) {
+  if (typeof low !== "number" || typeof high !== "number") {
+    return value;
+  }
+  return colorComponent(low + (value / 255) * (high - low));
 }
 
 function parseToUnicodeCMap(source) {
@@ -1155,17 +1578,21 @@ function incrementUnicodeString(text, offset) {
 
 function textTokenToBytes(value) {
   if (value?.hex) {
-    const hex = value.hex.length % 2 ? `${value.hex}0` : value.hex;
-    const bytes = [];
-    for (let index = 0; index < hex.length; index += 2) {
-      bytes.push(parseInt(hex.slice(index, index + 2), 16));
-    }
-    return bytes;
+    return Array.from(hexStringToBytes(value.hex));
   }
   if (value?.string) {
     return Array.from(value.string).map((char) => char.charCodeAt(0) & 0xff);
   }
   return [];
+}
+
+function hexStringToBytes(value) {
+  const hex = value.length % 2 ? `${value}0` : value;
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let index = 0; index < hex.length; index += 2) {
+    bytes[index / 2] = parseInt(hex.slice(index, index + 2), 16) || 0;
+  }
+  return bytes;
 }
 
 function decodeWithCMap(bytes, cmap) {

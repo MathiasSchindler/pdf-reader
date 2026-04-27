@@ -87,16 +87,17 @@ The renderer is still experimental. It can parse enough of the cached Bundestag 
 Currently useful capabilities include:
 
 - direct PDF object parsing
-- Flate-compressed object stream decoding via `DecompressionStream`
-- page tree walking
+- Flate, ASCIIHex, ASCII85, and RunLength stream decoding
+- page tree walking with inherited MediaBox/CropBox/Rotate handling
 - page content stream concatenation
 - basic `ToUnicode` CMap reading
-- a small subset of text and path operators
+- a small subset of text and path operators, including fill/stroke/invisible text rendering modes
 - cubic Bezier path rendering for vector-heavy pages
 - basic graphics state alpha, dash, miter, and color-space color operands
+- basic clipping paths and even-odd fills
 - Form XObject interpretation
 - JPEG image XObject rendering via browser image decoding
-- simple 8-bit raw and Flate image XObject rendering for gray, RGB, ICC-like, and CMYK-like data, including grayscale soft masks
+- simple raw image XObject rendering for gray, RGB, ICC-like, CMYK-like, and Indexed data, including Decode arrays, TIFF/PNG predictors, and grayscale soft masks
 - common PDF base-font mapping to browser font families
 - unsupported-operator reporting
 - literal-string octal escape decoding for some documents without `ToUnicode` maps
@@ -104,10 +105,11 @@ Currently useful capabilities include:
 Known gaps include:
 
 - embedded font shaping and real font program interpretation
-- JPX/JPEG 2000, indexed, predictor-heavy, masked, and complex image XObjects
+- JPX/JPEG 2000, masked, and complex image XObjects
 - full external graphics state handling
+- text clipping modes
 - calibrated, ICC, indexed, separation, and pattern color spaces
-- clipping behavior beyond accepted no-ops
-- filters beyond `FlateDecode`
+- advanced clipping interactions and transparency groups
+- less common stream filters beyond Flate, ASCIIHex, ASCII85, and RunLength
 
 Treat the output as a readable diagnostic rendering, not an archival or conformance-grade PDF renderer.
