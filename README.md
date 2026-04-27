@@ -21,6 +21,8 @@ By default, the reader loads `./samples.js`. The manifest includes one generated
 
 The `Pages` control accepts `all`, a single page such as `3`, a range such as `1-5`, or a comma-separated list such as `1,3,7-9`. The `View` control switches between `pdf-lite`, PDF.js, and `Difference`. The difference view renders the same selected pages through both engines, compares pixels, and paints matching pixels black. Pixels where `pdf-lite` is brighter are red; pixels where PDF.js is brighter are green. The inspector reports changed-pixel totals, red/green counts, mean delta, and max delta. This mode requires the ignored local `vendor/pdfjs/` files.
 
+PDF.js is only a development comparator in this project. It is not a fallback renderer for `pdf-lite`, and production behavior should not silently switch to PDF.js when `pdf-lite` lacks a feature.
+
 The manifest and PDF base path can be overridden from the URL:
 
 ```text
@@ -66,7 +68,7 @@ pdf-reader/
 
 `index.html` is deliberately small. It only wires up the reader UI and loads the module app.
 
-`src/reader-app.js` owns application behavior: manifest loading, document selection, page-range parsing, scale changes, rendering pages to canvases, optional PDF.js comparison rendering, and showing renderer audit information.
+`src/reader-app.js` owns application behavior: manifest loading, document selection, page-range parsing, scale changes, rendering pages to canvases, diagnostic PDF.js comparison rendering, and showing renderer audit information.
 
 `src/pdf-lite.js` is the renderer engine copied from the experiment. It should stay independent of the reader UI and should not know about Bundestag manifests, PDF.js, Meltdown, or quality comparison tools.
 
@@ -92,20 +94,23 @@ Currently useful capabilities include:
 - page tree walking with inherited MediaBox/CropBox/Rotate handling
 - page content stream concatenation
 - basic `ToUnicode` CMap reading
-- a small subset of text and path operators, including fill/stroke/invisible text rendering modes and scaled text matrices
+- PDF font width-table handling for simple fonts and Type0/CID descendant fonts, including `Widths`, `W`, `DW`, and variable-width CMap codes
+- a small subset of text and path operators, including fill/stroke/invisible text rendering modes and scaled or rotated text matrices
 - cubic Bezier path rendering for vector-heavy pages
+- compound path fills for outlined/vectorized glyphs with multiple subpaths and counters
 - basic graphics state alpha, dash, miter, and color-space color operands
 - basic clipping paths and even-odd fills
 - Form XObject interpretation
 - JPEG image XObject rendering via browser image decoding
 - simple raw image XObject rendering for gray, RGB, ICC-like, CMYK-like, and Indexed data, including Decode arrays, TIFF/PNG predictors, and grayscale soft masks
-- common PDF base-font mapping to browser font families
+- common PDF base-font and named-family mapping to browser font stacks, including serif/sans/mono families used by the sample corpus
 - unsupported-operator reporting
 - literal-string octal escape decoding for some documents without `ToUnicode` maps
 
 Known gaps include:
 
-- embedded font shaping and real font program interpretation
+- embedded font loading, shaping, and real font program interpretation; documents such as the Claude Mythos system card can still differ from renderers that use the embedded fonts exactly
+- PDFs that convert text to vector outlines instead of normal text operators, such as `fundamentacao.pdf`, render through the path machinery rather than the font machinery; layout can be recognizable while glyph shapes look odd or unselectable
 - JPX/JPEG 2000, masked, and complex image XObjects
 - full external graphics state handling
 - text clipping modes

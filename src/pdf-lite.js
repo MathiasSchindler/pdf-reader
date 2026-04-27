@@ -56,6 +56,8 @@ class PdfLiteDocument {
         baseFont: font.baseFont,
         hasToUnicode: Boolean(font.toUnicode),
         cmapEntries: font.toUnicode?.size || 0,
+        hasWidths: font.widths.size > 0,
+        defaultWidth: font.defaultWidth,
       })),
       warnings: this.warnings,
     };
@@ -197,12 +199,19 @@ class PdfLiteDocument {
             }
           }
         }
+        const descendantFont = Array.isArray(font.DescendantFonts) ? this.resolve(font.DescendantFonts[0]) : null;
+        const metrics = buildFontMetrics(font, descendantFont, toUnicode);
         this.fonts.set(objectId, {
           objectId,
           resourceName,
           subtype: font.Subtype || "unknown",
           baseFont: font.BaseFont || "unknown",
           toUnicode,
+          widths: metrics.widths,
+          defaultWidth: metrics.defaultWidth,
+          hasExplicitDefaultWidth: metrics.hasExplicitDefaultWidth,
+          codeByteWidths: metrics.codeByteWidths,
+          isCidFont: metrics.isCidFont,
         });
       }
     }
@@ -293,6 +302,7 @@ class ContentRenderer {
       lineCap: "butt",
       lineJoin: "miter",
       currentPoint: null,
+      currentSubpathStart: null,
       fontName: null,
       fontSize: 10,
       charSpacing: 0,
@@ -458,6 +468,7 @@ class ContentRenderer {
         break;
       case "h":
         this.context.closePath();
+        this.state.currentPoint = this.state.currentSubpathStart;
         break;
       case "W":
         this.clip("nonzero");
@@ -500,6 +511,7 @@ class ContentRenderer {
       case "n":
         this.context.beginPath();
         this.state.currentPoint = null;
+        this.state.currentSubpathStart = null;
         break;
       case "BDC":
       case "BMC":
@@ -532,14 +544,14 @@ class ContentRenderer {
   }
 
   showText(value) {
-    const text = this.decodeText(value);
+    const glyphs = this.decodeGlyphRun(value);
+    const text = glyphs.map((glyph) => glyph.text).join("");
     if (!text) {
       return;
     }
+    const font = this.currentFont();
     const textMatrix = multiplyMatrix(this.state.ctm, this.state.textMatrix);
-    const textXScale = Math.hypot(textMatrix[0], textMatrix[1]) || 1;
-    const textYScale = Math.hypot(textMatrix[2], textMatrix[3]) || textXScale;
-    const matrixHorizontalScale = textXScale / textYScale;
+    const textYScale = Math.hypot(textMatrix[2], textMatrix[3]) || Math.hypot(textMatrix[0], textMatrix[1]) || 1;
     const fontSize = Math.abs(this.state.fontSize * textYScale * this.scale) || 1;
     this.context.save();
     this.context.fillStyle = this.state.fill;
@@ -548,15 +560,37 @@ class ContentRenderer {
     this.context.lineWidth = this.state.lineWidth * this.scale;
     this.context.lineCap = this.state.lineCap;
     this.context.lineJoin = this.state.lineJoin;
-    this.context.font = canvasFontFor(this.currentFont(), fontSize);
-    const [canvasX, canvasY] = this.pagePoint(textMatrix[4], textMatrix[5] + this.state.textRise);
+    this.context.font = canvasFontFor(font, fontSize);
+    const [originX, originY] = transformPoint(textMatrix, 0, this.state.textRise);
+    const [canvasX, canvasY] = this.pagePoint(originX, originY);
+    const [textXAxisX, textXAxisY] = this.pageVector(textMatrix[0], textMatrix[1]);
+    const [textYAxisX, textYAxisY] = this.pageVector(textMatrix[2], textMatrix[3]);
+    const unitScale = Math.hypot(textYAxisX, textYAxisY) || Math.hypot(textXAxisX, textXAxisY) || this.scale || 1;
     this.context.translate(canvasX, canvasY);
-    this.context.rotate((this.rotation * Math.PI) / 180);
-    this.context.scale(matrixHorizontalScale * this.state.horizontalScale, 1);
-    this.paintText(text, 0, 0);
-    const advance = this.context.measureText(text).width / (this.scale * textYScale);
+    this.context.transform(textXAxisX / unitScale, textXAxisY / unitScale, -textYAxisX / unitScale, -textYAxisY / unitScale, 0, 0);
+    this.context.scale(this.state.horizontalScale, 1);
+    let advance;
+    let advanceIncludesSpacing = false;
+    if (glyphs.some((glyph) => Number.isFinite(glyph.width))) {
+      advance = this.paintGlyphRun(glyphs, unitScale);
+      advanceIncludesSpacing = true;
+    } else {
+      this.paintText(text, 0, 0);
+      advance = this.context.measureText(text).width / unitScale;
+    }
     this.context.restore();
-    this.advanceText(this.textAdvance(text, advance));
+    this.advanceText(advanceIncludesSpacing ? advance * this.state.horizontalScale : this.textAdvance(text, advance));
+  }
+
+  paintGlyphRun(glyphs, unitScale) {
+    let x = 0;
+    for (const glyph of glyphs) {
+      if (glyph.text) {
+        this.paintText(glyph.text, x * unitScale, 0);
+      }
+      x += this.glyphAdvance(glyph, unitScale) + this.spacingAdvance(glyph.text);
+    }
+    return x;
   }
 
   paintText(text, x, y) {
@@ -577,8 +611,20 @@ class ContentRenderer {
   }
 
   textAdvance(text, measuredWidth) {
-    const spaces = Array.from(text).filter((char) => char === " ").length;
-    return (measuredWidth + text.length * this.state.charSpacing + spaces * this.state.wordSpacing) * this.state.horizontalScale;
+    return (measuredWidth + this.spacingAdvance(text)) * this.state.horizontalScale;
+  }
+
+  spacingAdvance(text) {
+    const chars = Array.from(text);
+    const spaces = chars.filter((char) => char === " ").length;
+    return chars.length * this.state.charSpacing + spaces * this.state.wordSpacing;
+  }
+
+  glyphAdvance(glyph, unitScale) {
+    if (Number.isFinite(glyph.width)) {
+      return (glyph.width / 1000) * this.state.fontSize;
+    }
+    return this.context.measureText(glyph.text).width / unitScale;
   }
 
   advanceText(amount) {
@@ -586,12 +632,11 @@ class ContentRenderer {
   }
 
   decodeText(value) {
-    const bytes = textTokenToBytes(value);
-    const font = this.currentFont();
-    if (font?.toUnicode?.size) {
-      return decodeWithCMap(bytes, font.toUnicode);
-    }
-    return decodeWinAnsi(bytes);
+    return this.decodeGlyphRun(value).map((glyph) => glyph.text).join("");
+  }
+
+  decodeGlyphRun(value) {
+    return decodeGlyphRun(textTokenToBytes(value), this.currentFont());
   }
 
   currentFont() {
@@ -815,9 +860,10 @@ class ContentRenderer {
 
   pathMove(operands) {
     const [x, y] = this.point(operands[0], operands[1]);
-    this.context.beginPath();
     this.context.moveTo(x, y);
-    this.state.currentPoint = [Number(operands[0]) || 0, Number(operands[1]) || 0];
+    const point = [Number(operands[0]) || 0, Number(operands[1]) || 0];
+    this.state.currentPoint = point;
+    this.state.currentSubpathStart = point;
   }
 
   pathLine(operands) {
@@ -858,7 +904,6 @@ class ContentRenderer {
     const [x2, y2] = this.point(x + width, y);
     const [x3, y3] = this.point(x + width, y + height);
     const [x4, y4] = this.point(x, y + height);
-    this.context.beginPath();
     this.context.moveTo(x1, y1);
     this.context.lineTo(x2, y2);
     this.context.lineTo(x3, y3);
@@ -918,6 +963,7 @@ class ContentRenderer {
     this.context.restore();
     this.context.beginPath();
     this.state.currentPoint = null;
+    this.state.currentSubpathStart = null;
   }
 
   fill(rule = "nonzero") {
@@ -928,6 +974,7 @@ class ContentRenderer {
     this.context.restore();
     this.context.beginPath();
     this.state.currentPoint = null;
+    this.state.currentSubpathStart = null;
   }
 }
 
@@ -1280,6 +1327,71 @@ function numericArray(value) {
   return Array.isArray(value) && value.every((item) => typeof item === "number") ? value : null;
 }
 
+function buildFontMetrics(font, descendantFont, toUnicode) {
+  const isCidFont = font.Subtype === "Type0" || Boolean(descendantFont);
+  const widths = isCidFont ? cidWidthMap(descendantFont?.W) : simpleWidthMap(font.FirstChar, font.Widths);
+  const explicitDefaultWidth = Number(isCidFont ? descendantFont?.DW : font.MissingWidth);
+  return {
+    widths,
+    defaultWidth: Number.isFinite(explicitDefaultWidth) ? explicitDefaultWidth : isCidFont ? 1000 : 500,
+    hasExplicitDefaultWidth: Number.isFinite(explicitDefaultWidth),
+    codeByteWidths: fontCodeByteWidths(toUnicode, isCidFont),
+    isCidFont,
+  };
+}
+
+function simpleWidthMap(firstChar, widths) {
+  const map = new Map();
+  if (!Array.isArray(widths)) {
+    return map;
+  }
+  const first = Number(firstChar) || 0;
+  widths.forEach((width, index) => {
+    if (Number.isFinite(width)) {
+      map.set(first + index, width);
+    }
+  });
+  return map;
+}
+
+function cidWidthMap(widths) {
+  const map = new Map();
+  if (!Array.isArray(widths)) {
+    return map;
+  }
+  for (let index = 0; index < widths.length;) {
+    const first = Number(widths[index++]);
+    const next = widths[index++];
+    if (!Number.isFinite(first)) {
+      continue;
+    }
+    if (Array.isArray(next)) {
+      next.forEach((width, offset) => {
+        if (Number.isFinite(width)) {
+          map.set(first + offset, width);
+        }
+      });
+      continue;
+    }
+    const last = Number(next);
+    const width = Number(widths[index++]);
+    if (!Number.isFinite(last) || !Number.isFinite(width)) {
+      continue;
+    }
+    for (let code = first; code <= last; code += 1) {
+      map.set(code, width);
+    }
+  }
+  return map;
+}
+
+function fontCodeByteWidths(toUnicode, isCidFont) {
+  if (toUnicode?.size) {
+    return Array.from(new Set(Array.from(toUnicode.keys()).map((key) => key.length / 2))).sort((left, right) => right - left);
+  }
+  return isCidFont ? [2] : [1];
+}
+
 function normalizeRotation(value) {
   const rotation = Number(value) || 0;
   return ((rotation % 360) + 360) % 360;
@@ -1622,6 +1734,78 @@ function decodeWithCMap(bytes, cmap) {
   return output;
 }
 
+function decodeGlyphRun(bytes, font) {
+  if (!bytes.length) {
+    return [];
+  }
+  if (!font) {
+    return bytes.map((byte) => ({ code: byte, text: decodeWinAnsi([byte]), width: null }));
+  }
+  const glyphs = [];
+  const codeByteWidths = font.codeByteWidths?.length ? font.codeByteWidths : font.isCidFont ? [2] : [1];
+  for (let index = 0; index < bytes.length;) {
+    const match = matchMappedGlyph(bytes, index, codeByteWidths, font);
+    if (match) {
+      glyphs.push(match.glyph);
+      index += match.byteWidth;
+      continue;
+    }
+    const byteWidth = font.isCidFont && index + 1 < bytes.length ? 2 : 1;
+    const codeBytes = bytes.slice(index, index + byteWidth);
+    const code = codeFromBytes(codeBytes);
+    glyphs.push({
+      code,
+      text: font.isCidFont ? String.fromCharCode(code) : decodeWinAnsi([codeBytes[0]]),
+      width: fontWidth(font, code),
+    });
+    index += byteWidth;
+  }
+  return glyphs;
+}
+
+function matchMappedGlyph(bytes, index, codeByteWidths, font) {
+  if (!font.toUnicode?.size) {
+    return null;
+  }
+  for (const byteWidth of codeByteWidths) {
+    if (index + byteWidth > bytes.length) {
+      continue;
+    }
+    const codeBytes = bytes.slice(index, index + byteWidth);
+    const key = codeBytes.map((byte) => byte.toString(16).toUpperCase().padStart(2, "0")).join("");
+    if (!font.toUnicode.has(key)) {
+      continue;
+    }
+    const code = parseInt(key, 16);
+    return {
+      byteWidth,
+      glyph: {
+        code,
+        text: font.toUnicode.get(key),
+        width: fontWidth(font, code),
+      },
+    };
+  }
+  return null;
+}
+
+function codeFromBytes(bytes) {
+  return bytes.reduce((code, byte) => (code << 8) | byte, 0);
+}
+
+function fontWidth(font, code) {
+  if (!Number.isFinite(code)) {
+    return null;
+  }
+  if (font.widths?.has(code)) {
+    return font.widths.get(code);
+  }
+  if (font.widths?.size > 0) {
+    return Number.isFinite(font.defaultWidth) ? font.defaultWidth : null;
+  }
+  return null;
+}
+
 function decodeWinAnsi(bytes) {
   return bytes.map((byte) => WIN_ANSI.get(byte) || String.fromCharCode(byte)).join("");
 }
@@ -1690,21 +1874,48 @@ function fontWeightFor(font) {
   if (base.includes("black") || base.includes("heavy")) {
     return "900";
   }
-  if (base.includes("bold") || base.includes("semibold") || base.includes("demibold")) {
+  if (base.includes("semibold") || base.includes("demibold")) {
+    return "600";
+  }
+  if (base.includes("bold")) {
     return "700";
+  }
+  if (base.includes("medium")) {
+    return "500";
+  }
+  if (base.includes("light")) {
+    return "300";
   }
   return "400";
 }
 
 function fontFamilyFor(font) {
   const base = normalizedFontName(font);
+  if (base.includes("lora")) {
+    return "Lora, Georgia, Times New Roman, serif";
+  }
+  if (base.includes("merriweather")) {
+    return "Merriweather, Georgia, Times New Roman, serif";
+  }
+  if (base.includes("poppins")) {
+    return "Poppins, Avenir Next, Helvetica Neue, Arial, sans-serif";
+  }
+  if (base.includes("roboto")) {
+    return base.includes("mono") ? "Roboto Mono, ui-monospace, monospace" : "Roboto, Helvetica Neue, Arial, sans-serif";
+  }
   if (base.includes("courier") || base.includes("mono")) {
-    return "ui-monospace, monospace";
+    return "Courier New, ui-monospace, monospace";
   }
-  if (base.includes("times") || base.includes("serif")) {
-    return "Times New Roman, serif";
+  if (base.includes("times")) {
+    return "Times New Roman, Times, serif";
   }
-  return "Arial, sans-serif";
+  if (base.includes("serif") || base.includes("georgia") || base.includes("mincho")) {
+    return "Georgia, Times New Roman, serif";
+  }
+  if (base.includes("arial")) {
+    return "Arial, Helvetica, sans-serif";
+  }
+  return "Arial, Helvetica, sans-serif";
 }
 
 function normalizedFontName(font) {
