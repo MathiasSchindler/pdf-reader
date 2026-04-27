@@ -5,8 +5,8 @@ This directory is a standalone home for the small dependency-free PDF reader tha
 The goal is to keep three things separate:
 
 - `src/pdf-lite.js`: the experimental PDF parser and canvas renderer.
-- `src/reader-app.js`: the browser reader UI that loads documents and renders pages.
-- comparison experiments: PDF.js comparisons, Meltdown raster comparisons, and pixel-diff tooling. Those are intentionally not part of this runtime app.
+- `src/reader-app.js`: the browser reader UI that loads documents and renders pages, including an optional PDF.js comparison view when `vendor/pdfjs/` is present.
+- comparison experiments beyond PDF.js pixel diffs: Meltdown raster comparisons and cumulative layer diagnostics. Those are intentionally not part of this runtime app.
 
 ## Run
 
@@ -18,6 +18,8 @@ http://localhost:8787/
 ```
 
 By default, the reader loads `./samples.js`. The manifest includes one generated smoke-test PDF from `fixtures/` and references local PDFs below `pdf-files/` when that ignored corpus is present.
+
+The `Pages` control accepts `all`, a single page such as `3`, a range such as `1-5`, or a comma-separated list such as `1,3,7-9`. The `View` control switches between `pdf-lite`, PDF.js, and `Difference`. The difference view renders the same selected pages through both engines, compares pixels, and paints matching pixels black. Pixels where `pdf-lite` is brighter are red; pixels where PDF.js is brighter are green. The inspector reports changed-pixel totals, red/green counts, mean delta, and max delta. This mode requires the ignored local `vendor/pdfjs/` files.
 
 The manifest and PDF base path can be overridden from the URL:
 
@@ -64,19 +66,18 @@ pdf-reader/
 
 `index.html` is deliberately small. It only wires up the reader UI and loads the module app.
 
-`src/reader-app.js` owns application behavior: manifest loading, document selection, scale changes, rendering pages to canvases, and showing renderer audit information.
+`src/reader-app.js` owns application behavior: manifest loading, document selection, page-range parsing, scale changes, rendering pages to canvases, optional PDF.js comparison rendering, and showing renderer audit information.
 
 `src/pdf-lite.js` is the renderer engine copied from the experiment. It should stay independent of the reader UI and should not know about Bundestag manifests, PDF.js, Meltdown, or quality comparison tools.
 
 ## What Is Not Included
 
-The original experiment also contained comparison modes:
+The original experiment also contained comparison modes beyond the built-in PDF.js difference view:
 
-- built-in renderer vs PDF.js pixel heatmaps
 - built-in renderer vs Meltdown page raster heatmaps
 - cumulative Meltdown layer diagnostics
 
-Those are useful, but they belong outside the reader app. Keeping them out makes this project easier to understand: it is a PDF reader using the `pdf-lite` engine, not a renderer benchmark suite.
+Those are useful, but they belong outside the reader app. Keeping them out makes this project easier to understand: it is a PDF reader using the `pdf-lite` engine with one lightweight PDF.js diagnostic mode, not a renderer benchmark suite.
 
 If those experiments are needed again, put them in a separate `experiments/` directory or keep using `bt-drucksachen/experimental/pdf` as the comparison workbench.
 
@@ -91,7 +92,7 @@ Currently useful capabilities include:
 - page tree walking with inherited MediaBox/CropBox/Rotate handling
 - page content stream concatenation
 - basic `ToUnicode` CMap reading
-- a small subset of text and path operators, including fill/stroke/invisible text rendering modes
+- a small subset of text and path operators, including fill/stroke/invisible text rendering modes and scaled text matrices
 - cubic Bezier path rendering for vector-heavy pages
 - basic graphics state alpha, dash, miter, and color-space color operands
 - basic clipping paths and even-odd fills

@@ -536,8 +536,11 @@ class ContentRenderer {
     if (!text) {
       return;
     }
-    const [x, y] = transformPoint(this.state.ctm, this.state.textMatrix[4], this.state.textMatrix[5]);
-    const fontSize = Math.abs(this.state.fontSize * this.state.ctm[3] * this.scale);
+    const textMatrix = multiplyMatrix(this.state.ctm, this.state.textMatrix);
+    const textXScale = Math.hypot(textMatrix[0], textMatrix[1]) || 1;
+    const textYScale = Math.hypot(textMatrix[2], textMatrix[3]) || textXScale;
+    const matrixHorizontalScale = textXScale / textYScale;
+    const fontSize = Math.abs(this.state.fontSize * textYScale * this.scale) || 1;
     this.context.save();
     this.context.fillStyle = this.state.fill;
     this.context.globalAlpha = this.state.fillAlpha;
@@ -546,12 +549,12 @@ class ContentRenderer {
     this.context.lineCap = this.state.lineCap;
     this.context.lineJoin = this.state.lineJoin;
     this.context.font = canvasFontFor(this.currentFont(), fontSize);
-    const [canvasX, canvasY] = this.pagePoint(x, y + this.state.textRise);
+    const [canvasX, canvasY] = this.pagePoint(textMatrix[4], textMatrix[5] + this.state.textRise);
     this.context.translate(canvasX, canvasY);
     this.context.rotate((this.rotation * Math.PI) / 180);
-    this.context.scale(this.state.horizontalScale, 1);
+    this.context.scale(matrixHorizontalScale * this.state.horizontalScale, 1);
     this.paintText(text, 0, 0);
-    const advance = this.context.measureText(text).width / this.scale;
+    const advance = this.context.measureText(text).width / (this.scale * textYScale);
     this.context.restore();
     this.advanceText(this.textAdvance(text, advance));
   }

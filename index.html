@@ -21,6 +21,18 @@
           <span>Scale</span>
           <input id="scale-input" type="range" min="0.55" max="1.6" value="0.9" step="0.05">
         </label>
+        <label>
+          <span>Pages</span>
+          <input id="page-range-input" type="text" placeholder="all" inputmode="numeric">
+        </label>
+        <label>
+          <span>View</span>
+          <select id="view-mode-select">
+            <option value="lite">pdf-lite</option>
+            <option value="pdfjs">PDF.js</option>
+            <option value="diff">Difference</option>
+          </select>
+        </label>
         <button id="render-button" type="button">Render</button>
       </div>
     </header>
@@ -43,6 +55,10 @@
           <h2>Unsupported Operators</h2>
           <pre id="operator-output"></pre>
         </section>
+        <section>
+          <h2>Difference</h2>
+          <pre id="difference-output"></pre>
+        </section>
       </aside>
 
       <section class="viewer" aria-label="Rendered PDF pages">
@@ -50,6 +66,6 @@
       </section>
     </main>
 
-    <script type="module" src="./src/reader-app.js"></script>
+    <script type="module" src="./src/reader-app.js?v=page-ranges"></script>
   </body>
 </html>

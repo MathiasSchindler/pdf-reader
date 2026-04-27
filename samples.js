@@ -28,6 +28,13 @@ const BT_DRUCKSACHEN = [
     pdfUrl: "fixtures/pdf-lite-indexed-image.pdf"
   },
   {
+    id: "pdf-lite-text-matrix",
+    number: "fixture/5",
+    type: "generated",
+    title: "pdf-lite text matrix fixture",
+    pdfUrl: "fixtures/pdf-lite-text-matrix.pdf"
+  },
+  {
     id: "bt-21-5511",
     number: "21/5511",
     type: "Bundestag Drucksache",

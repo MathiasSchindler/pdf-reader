@@ -80,6 +80,7 @@ h2 {
   font-size: 12px;
 }
 
+input[type="text"],
 select,
 button {
   min-height: 34px;
@@ -89,8 +90,20 @@ button {
   color: var(--ink);
 }
 
-select {
+#document-select {
   width: min(48vw, 520px);
+}
+
+#view-mode-select {
+  min-width: 128px;
+}
+
+#page-range-input {
+  width: 132px;
+  padding: 7px 8px;
+}
+
+select {
   padding: 7px 8px;
 }
 
