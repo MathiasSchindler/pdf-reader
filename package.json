@@ -3,11 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "npm run build:esm && npm run build:global",
-    "build:esm": "esbuild src/pdf-lite/index.js --bundle --format=esm --minify --legal-comments=none --outfile=dist/pdf-lite.min.js",
-    "build:global": "esbuild src/pdf-lite/global.js --bundle --format=iife --minify --legal-comments=none --outfile=dist/pdf-lite.global.min.js"
+    "build": "node scripts/build.js",
+    "size": "node scripts/build.js"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0"
+    "esbuild": "^0.25.0",
+    "terser": "^5.46.2"
   }
 }

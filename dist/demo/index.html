@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pdf-lite demo</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f4f4f1;
+      color: #202020;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      padding: 12px;
+      background: #ffffff;
+      border-bottom: 1px solid #d6d6d0;
+    }
+
+    h1 {
+      margin: 0 10px 0 0;
+      font-size: 16px;
+      font-weight: 650;
+    }
+
+    button,
+    label.file-button,
+    input[type="number"] {
+      height: 34px;
+      border: 1px solid #b9b9b1;
+      border-radius: 6px;
+      background: #ffffff;
+      color: #202020;
+      font: inherit;
+    }
+
+    button,
+    label.file-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 12px;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      cursor: default;
+      opacity: 0.5;
+    }
+
+    input[type="file"] {
+      position: absolute;
+      inline-size: 1px;
+      block-size: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    input[type="number"] {
+      width: 76px;
+      padding: 0 8px;
+    }
+
+    #status {
+      margin-left: auto;
+      min-width: min(100%, 220px);
+      font-size: 13px;
+      color: #55554f;
+      text-align: right;
+    }
+
+    main {
+      min-height: 0;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    #drop-zone {
+      margin: 12px;
+      padding: 12px;
+      border: 1px dashed #b8b8ae;
+      border-radius: 8px;
+      background: #fbfbf8;
+      color: #55554f;
+      text-align: center;
+      font-size: 14px;
+    }
+
+    #drop-zone.drag-over {
+      border-color: #506a9f;
+      background: #eef3ff;
+      color: #203c72;
+    }
+
+    #viewport {
+      min-height: 0;
+      overflow: auto;
+      padding: 12px;
+      display: grid;
+      place-items: start center;
+    }
+
+    canvas {
+      max-width: 100%;
+      height: auto;
+      background: #ffffff;
+      box-shadow: 0 2px 14px rgba(0, 0, 0, 0.16);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>pdf-lite</h1>
+    <button id="sample-button" type="button">Sample</button>
+    <label class="file-button" for="file-input">Open PDF</label>
+    <input id="file-input" type="file" accept="application/pdf,.pdf">
+    <button id="previous-button" type="button" aria-label="Previous page">Prev</button>
+    <button id="next-button" type="button" aria-label="Next page">Next</button>
+    <label>
+      Scale
+      <input id="scale-input" type="number" min="0.25" max="4" step="0.25" value="1.25">
+    </label>
+    <span id="status">Loading sample...</span>
+  </header>
+  <main>
+    <div id="drop-zone">Drop PDF</div>
+    <div id="viewport"><canvas id="page-canvas"></canvas></div>
+  </main>
+
+  <script type="module">
+    import { loadPdfLite } from "../pdf-lite.viewer.min.js";
+
+    const sampleUrl = "./sample.pdf";
+    const canvas = document.getElementById("page-canvas");
+    const status = document.getElementById("status");
+    const fileInput = document.getElementById("file-input");
+    const sampleButton = document.getElementById("sample-button");
+    const previousButton = document.getElementById("previous-button");
+    const nextButton = document.getElementById("next-button");
+    const scaleInput = document.getElementById("scale-input");
+    const dropZone = document.getElementById("drop-zone");
+
+    let pdf = null;
+    let pageIndex = 0;
+    let objectUrl = null;
+
+    sampleButton.addEventListener("click", () => loadDocument(sampleUrl, "sample.pdf"));
+    previousButton.addEventListener("click", () => renderPage(pageIndex - 1));
+    nextButton.addEventListener("click", () => renderPage(pageIndex + 1));
+    scaleInput.addEventListener("change", () => renderPage(pageIndex));
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files?.[0];
+      if (file) loadFile(file);
+    });
+
+    for (const eventName of ["dragenter", "dragover"]) {
+      dropZone.addEventListener(eventName, (event) => {
+        event.preventDefault();
+        dropZone.classList.add("drag-over");
+      });
+    }
+
+    for (const eventName of ["dragleave", "drop"]) {
+      dropZone.addEventListener(eventName, (event) => {
+        event.preventDefault();
+        dropZone.classList.remove("drag-over");
+      });
+    }
+
+    dropZone.addEventListener("drop", (event) => {
+      const file = Array.from(event.dataTransfer?.files || []).find((item) => item.type === "application/pdf" || item.name.toLowerCase().endsWith(".pdf"));
+      if (file) loadFile(file);
+    });
+
+    async function loadFile(file) {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      objectUrl = URL.createObjectURL(file);
+      await loadDocument(objectUrl, file.name);
+    }
+
+    async function loadDocument(url, label) {
+      setStatus(`Loading ${label}...`);
+      try {
+        pdf = await loadPdfLite(url);
+        pageIndex = 0;
+        await renderPage(0);
+      } catch (error) {
+        pdf = null;
+        setStatus(error.message, true);
+        updateButtons();
+      }
+    }
+
+    async function renderPage(nextIndex) {
+      if (!pdf) return;
+      pageIndex = Math.min(Math.max(nextIndex, 0), pdf.pages.length - 1);
+      setStatus(`Rendering ${pageIndex + 1} / ${pdf.pages.length}...`);
+      try {
+        await pdf.renderPage(pageIndex, canvas, { scale: Number(scaleInput.value) || 1 });
+        setStatus(`${pageIndex + 1} / ${pdf.pages.length}`);
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+      updateButtons();
+    }
+
+    function updateButtons() {
+      const hasPdf = Boolean(pdf);
+      previousButton.disabled = !hasPdf || pageIndex <= 0;
+      nextButton.disabled = !hasPdf || pageIndex >= (pdf?.pages.length || 0) - 1;
+    }
+
+    function setStatus(text, isError = false) {
+      status.textContent = text;
+      status.style.color = isError ? "#9b1c1c" : "#55554f";
+    }
+
+  updateButtons();
+  loadDocument(sampleUrl, "sample.pdf");
+  </script>
+</body>
+</html>

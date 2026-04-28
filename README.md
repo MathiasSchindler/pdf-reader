@@ -89,34 +89,59 @@ The renderer source should stay independent of the reader UI and should not know
 
 ## Distribution Builds
 
-The source is developed as modules, but the distributable renderer is one minified JavaScript file. Build both supported distribution flavors with:
+The source is developed as modules, but each distributable renderer profile is one minified JavaScript file. Build all supported distribution files with:
 
 ```text
 npm run build
 ```
 
-This writes:
+`npm run size` runs the same build and prints raw, gzip, and brotli sizes.
 
-- `dist/pdf-lite.min.js`: an ESM bundle for `import` users.
-- `dist/pdf-lite.global.min.js`: a script-tag bundle that exposes `window.PdfLite`.
+The build uses feature flags and a Terser minification pass after bundling. Current profiles are:
 
-Use the ESM bundle when the host page can load JavaScript modules:
+```text
+profile  purpose
+full     development/comparison build with audit data and experimental embedded outline mode
+viewer   default third-party viewer build; stable rendering, images, embedded browser fonts, no diagnostics
+text     smallest build for text/vector-only PDFs; image XObjects disabled
+```
+
+For each profile, the build writes an ESM bundle and a global script bundle:
+
+- `dist/pdf-lite.min.js`: full ESM bundle.
+- `dist/pdf-lite.global.min.js`: full script-tag bundle.
+- `dist/pdf-lite.viewer.min.js`: viewer ESM bundle.
+- `dist/pdf-lite.viewer.global.min.js`: viewer script-tag bundle.
+- `dist/pdf-lite.text.min.js`: text/vector-only ESM bundle.
+- `dist/pdf-lite.text.global.min.js`: text/vector-only script-tag bundle.
+
+Current bundle sizes after minification are approximately:
+
+```text
+file                                raw      gzip     brotli
+dist/pdf-lite.min.js                55.9 KB  17.8 KB  15.8 KB
+dist/pdf-lite.viewer.min.js         50.9 KB  16.4 KB  14.6 KB
+dist/pdf-lite.text.min.js           45.6 KB  14.8 KB  13.1 KB
+```
+
+Use `dist/pdf-lite.viewer.min.js` as the normal single-file renderer for third-party pages that can load JavaScript modules:
+
 
 ```html
 <canvas id="page"></canvas>
 <script type="module">
-  import { loadPdfLite } from "./dist/pdf-lite.min.js";
+  import { loadPdfLite } from "./dist/pdf-lite.viewer.min.js";
 
   const pdf = await loadPdfLite("./example.pdf");
   await pdf.renderPage(0, document.getElementById("page"), { scale: 1.5 });
 </script>
 ```
 
-Use the global bundle when the host page wants a plain script tag:
+Use `dist/pdf-lite.viewer.global.min.js` when the host page wants a plain script tag:
 
 ```html
 <canvas id="page"></canvas>
-<script src="./dist/pdf-lite.global.min.js"></script>
+<script src="./dist/pdf-lite.viewer.global.min.js"></script>
 <script>
   (async () => {
     const pdf = await PdfLite.load("./example.pdf");
@@ -125,7 +150,21 @@ Use the global bundle when the host page wants a plain script tag:
 </script>
 ```
 
-The UI, sample manifest, PDF.js comparator, and difference view are not bundled into either distribution file. The bundle contains the renderer API only.
+Use the `full` profile for local development pages that need `audit()` output or the `fontMode: "embedded"` experimental outline renderer. Use the `text` profile only when the host application knows its PDFs do not need image XObjects.
+
+The UI, sample manifest, PDF.js comparator, and difference view are not bundled into any distribution file. The bundles contain the renderer API only.
+
+### Distribution Demo
+
+`dist/demo/index.html` is a minimal embeddable-example page. It imports `../pdf-lite.viewer.min.js`, opens `dist/demo/sample.pdf` by default, and also accepts a PDF through the file picker or by dropping a file onto the page.
+
+The demo uses the `viewer` profile because it is the smallest profile that is still appropriate for general PDF display: it omits diagnostics and experimental outline debugging, but keeps image rendering enabled for user-supplied PDFs. The `text` profile is smaller, but it intentionally disables image XObjects.
+
+Run the static server and open:
+
+```text
+http://localhost:8787/dist/demo/
+```
 
 ## What Is Not Included
 

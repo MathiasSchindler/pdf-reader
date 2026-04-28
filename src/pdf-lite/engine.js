@@ -7,6 +7,10 @@ const WIN_ANSI = new Map([
   [0x99, "™"], [0x9a, "š"], [0x9b, "›"], [0x9c, "œ"], [0x9e, "ž"], [0x9f, "Ÿ"]
 ]);
 
+const ENABLE_DIAGNOSTICS = typeof PDF_LITE_DIAGNOSTICS === "boolean" ? PDF_LITE_DIAGNOSTICS : true;
+const ENABLE_EXPERIMENTAL_OUTLINES = typeof PDF_LITE_EXPERIMENTAL_OUTLINES === "boolean" ? PDF_LITE_EXPERIMENTAL_OUTLINES : true;
+const ENABLE_IMAGES = typeof PDF_LITE_IMAGES === "boolean" ? PDF_LITE_IMAGES : true;
+
 export async function loadPdfLite(url) {
   const response = await fetch(url);
   if (!response.ok) {
@@ -41,6 +45,13 @@ class PdfLiteDocument {
   }
 
   audit() {
+    if (!ENABLE_DIAGNOSTICS) {
+      return {
+        url: this.url,
+        version: this.source.match(/%PDF-([^\r\n]+)/)?.[1] || "unknown",
+        pages: this.pages.length,
+      };
+    }
     return {
       url: this.url,
       version: this.source.match(/%PDF-([^\r\n]+)/)?.[1] || "unknown",
@@ -72,6 +83,9 @@ class PdfLiteDocument {
   }
 
   imageAudit() {
+    if (!ENABLE_DIAGNOSTICS) {
+      return [];
+    }
     return Array.from(this.objects.values())
       .filter((object) => object.value?.Subtype === "Image")
       .map((object) => ({
@@ -120,7 +134,7 @@ class PdfLiteDocument {
     const renderer = new ContentRenderer(this, page, context, { scale, width, height, boxWidth, boxHeight, rotation, originX: pageBox[0], originY: pageBox[1], fontMode: options.fontMode || "stable" });
     const streams = await this.getPageContentStreams(page);
     await renderer.interpret(streams.map((stream) => bytesToBinaryString(stream)).join("\n"));
-    return { unsupportedOperators: renderer.unsupportedOperators };
+    return { unsupportedOperators: ENABLE_DIAGNOSTICS ? renderer.unsupportedOperators : new Map() };
   }
 
   readDirectObjects() {
@@ -170,7 +184,9 @@ class PdfLiteDocument {
         }
         this.decodedObjectStreams += 1;
       } catch (error) {
-        this.warnings.push(`Could not decode object stream ${object.id}: ${error.message}`);
+        if (ENABLE_DIAGNOSTICS) {
+          this.warnings.push(`Could not decode object stream ${object.id}: ${error.message}`);
+        }
       }
     }
   }
@@ -227,7 +243,9 @@ class PdfLiteDocument {
               const cmapBytes = await this.decodeStream(cmapObject.stream.bytes, cmapObject.value);
               toUnicode = parseToUnicodeCMap(bytesToBinaryString(cmapBytes));
             } catch (error) {
-              this.warnings.push(`Could not decode ToUnicode map for ${resourceName}: ${error.message}`);
+              if (ENABLE_DIAGNOSTICS) {
+                this.warnings.push(`Could not decode ToUnicode map for ${resourceName}: ${error.message}`);
+              }
             }
           }
         }
@@ -237,7 +255,7 @@ class PdfLiteDocument {
         const metrics = buildFontMetrics(font, descendantFont, toUnicode);
         await installEmbeddedBrowserFont(embeddedFont, metrics, toUnicode);
         const embeddedOutlineUsable = Boolean(embeddedFont?.outlineFont && embeddedFont.outlineFont.kind !== "cff" && !metrics.isCidFont && toUnicode?.size);
-        const embeddedOutlineExperimental = Boolean(embeddedFont?.outlineFont?.kind === "cff" && !metrics.isCidFont && toUnicode?.size);
+        const embeddedOutlineExperimental = Boolean(ENABLE_EXPERIMENTAL_OUTLINES && embeddedFont?.outlineFont?.kind === "cff" && !metrics.isCidFont && toUnicode?.size);
         this.fonts.set(objectId, {
           objectId,
           resourceName,
@@ -358,7 +376,7 @@ class ContentRenderer {
     this.fontMode = metrics.fontMode || "stable";
     this.stack = [];
     this.state = this.defaultState();
-    this.unsupportedOperators = new Map();
+    this.unsupportedOperators = ENABLE_DIAGNOSTICS ? new Map() : null;
     this.resources = page.resources || {};
     this.resourceStack = [];
     this.xObjectDepth = 0;
@@ -704,7 +722,7 @@ class ContentRenderer {
   }
 
   canPaintEmbeddedGlyph(font, outlineFont) {
-    if (this.fontMode === "embedded") {
+    if (ENABLE_EXPERIMENTAL_OUTLINES && this.fontMode === "embedded") {
       return Boolean(!font.isCidFont && font.toUnicode?.size && outlineFont.kind !== "truetype-cid");
     }
     return Boolean(font.embeddedOutlineUsable);
@@ -813,7 +831,11 @@ class ContentRenderer {
       return;
     }
     if (dictionary.Subtype === "Image") {
-      await this.paintImageXObject(object);
+      if (!ENABLE_IMAGES) {
+        this.unsupported("Do/ImageDisabled");
+        return;
+      }
+      await paintImageXObject(this, object);
       return;
     }
     this.unsupported(`Do/${dictionary.Subtype || "unknown"}`);
@@ -848,130 +870,10 @@ class ContentRenderer {
     this.context.restore();
   }
 
-  async paintImageXObject(object) {
-    const filters = normalizeFilters(this.pdf.resolve(object.value.Filter));
-    try {
-      if (filters.length === 1 && ["DCTDecode", "DCT"].includes(filters[0])) {
-        const image = await createImageBitmap(new Blob([object.stream.bytes], { type: "image/jpeg" }));
-        this.drawUnitImage(image);
-        image.close?.();
-        return;
-      }
-      if (filters.every(isDataImageFilter)) {
-        const imageData = await this.imageDataForXObject(object);
-        if (imageData) {
-          const image = await createImageBitmap(imageData);
-          this.drawUnitImage(image, { smoothing: !isIndexedColorSpace(this.pdf.resolve(object.value.ColorSpace)) });
-          image.close?.();
-          return;
-        }
-      }
-      this.unsupported(`Do/Image/${filters.join("+") || "raw"}`);
-    } catch (error) {
-      this.unsupported("Do/ImageDecode");
-    }
-  }
-
-  drawUnitImage(image, options = {}) {
-    const [a, b, c, d, e, f] = this.state.ctm;
-    const [canvasX, canvasY] = this.pagePoint(e, f);
-    const [xA, xB] = this.pageVector(a, b);
-    const [yA, yB] = this.pageVector(c, d);
-    this.context.save();
-    this.context.imageSmoothingEnabled = options.smoothing !== false;
-    this.context.transform(xA, xB, yA, yB, canvasX, canvasY);
-    this.context.transform(1, 0, 0, -1, 0, 1);
-    this.context.drawImage(image, 0, 0, 1, 1);
-    this.context.restore();
-  }
-
-  async imageDataForXObject(object) {
-    const dictionary = object.value;
-    const width = Number(this.pdf.resolve(dictionary.Width));
-    const height = Number(this.pdf.resolve(dictionary.Height));
-    const bits = Number(this.pdf.resolve(dictionary.BitsPerComponent));
-    if (!Number.isFinite(width) || !Number.isFinite(height) || !Number.isFinite(bits)) {
-      return null;
-    }
-    const colorSpace = this.pdf.resolve(dictionary.ColorSpace);
-    const palette = await indexedColorPalette(this.pdf, colorSpace);
-    if (palette) {
-      const pixels = unpackIndexedSamples(applyImageDecodeParms(await this.pdf.decodeStream(object.stream.bytes, dictionary), dictionary, width, height), bits, width, height, dictionary.Decode);
-      const alpha = await this.imageAlphaForXObject(dictionary, width, height);
-      const imageData = new ImageData(width, height);
-      for (let pixelIndex = 0; pixelIndex < width * height; pixelIndex += 1) {
-        const color = palette.colors[pixels[pixelIndex]] || palette.colors[0] || [0, 0, 0];
-        const targetIndex = pixelIndex * 4;
-        imageData.data[targetIndex] = color[0];
-        imageData.data[targetIndex + 1] = color[1];
-        imageData.data[targetIndex + 2] = color[2];
-        imageData.data[targetIndex + 3] = alpha?.[pixelIndex] ?? 255;
-      }
-      return imageData;
-    }
-    if (bits !== 8) {
-      return null;
-    }
-    const pixels = applyImageDecodeParms(await this.pdf.decodeStream(object.stream.bytes, dictionary), dictionary, width, height);
-    const components = imageComponents(colorSpace, pixels.length, width, height);
-    if (![1, 3, 4].includes(components)) {
-      return null;
-    }
-    const expectedLength = width * height * components;
-    if (pixels.length < expectedLength) {
-      return null;
-    }
-    const alpha = await this.imageAlphaForXObject(dictionary, width, height);
-    const imageData = new ImageData(width, height);
-    for (let pixelIndex = 0; pixelIndex < width * height; pixelIndex += 1) {
-      const sourceIndex = pixelIndex * components;
-      const targetIndex = pixelIndex * 4;
-      const decoded = decodeImageComponents(pixels, sourceIndex, components, dictionary.Decode);
-      if (components === 1) {
-        const gray = decoded[0];
-        imageData.data[targetIndex] = gray;
-        imageData.data[targetIndex + 1] = gray;
-        imageData.data[targetIndex + 2] = gray;
-      } else if (components === 4) {
-        const [red, green, blue] = cmykToRgb(decoded[0], decoded[1], decoded[2], decoded[3]);
-        imageData.data[targetIndex] = red;
-        imageData.data[targetIndex + 1] = green;
-        imageData.data[targetIndex + 2] = blue;
-      } else {
-        imageData.data[targetIndex] = decoded[0];
-        imageData.data[targetIndex + 1] = decoded[1];
-        imageData.data[targetIndex + 2] = decoded[2];
-      }
-      imageData.data[targetIndex + 3] = alpha?.[pixelIndex] ?? 255;
-    }
-    return imageData;
-  }
-
-  async imageAlphaForXObject(dictionary, width, height) {
-    const maskObject = this.pdf.objectFor(dictionary.SMask);
-    if (!maskObject?.stream) {
-      return null;
-    }
-    const mask = maskObject.value;
-    const maskWidth = Number(this.pdf.resolve(mask.Width));
-    const maskHeight = Number(this.pdf.resolve(mask.Height));
-    const bits = Number(this.pdf.resolve(mask.BitsPerComponent));
-    if (maskWidth !== width || maskHeight !== height || bits !== 8) {
-      return null;
-    }
-    const filters = normalizeFilters(this.pdf.resolve(mask.Filter));
-    if (!filters.every(isDataImageFilter)) {
-      return null;
-    }
-    const pixels = applyImageDecodeParms(await this.pdf.decodeStream(maskObject.stream.bytes, mask), mask, width, height);
-    const components = imageComponents(this.pdf.resolve(mask.ColorSpace), pixels.length, width, height);
-    if (components !== 1 || pixels.length < width * height) {
-      return null;
-    }
-    return pixels;
-  }
-
   unsupported(operator) {
+    if (!ENABLE_DIAGNOSTICS) {
+      return;
+    }
     this.unsupportedOperators.set(operator, (this.unsupportedOperators.get(operator) || 0) + 1);
   }
 
@@ -1093,6 +995,129 @@ class ContentRenderer {
     this.state.currentPoint = null;
     this.state.currentSubpathStart = null;
   }
+}
+
+async function paintImageXObject(renderer, object) {
+  const filters = normalizeFilters(renderer.pdf.resolve(object.value.Filter));
+  try {
+    if (filters.length === 1 && ["DCTDecode", "DCT"].includes(filters[0])) {
+      const image = await createImageBitmap(new Blob([object.stream.bytes], { type: "image/jpeg" }));
+      drawUnitImage(renderer, image);
+      image.close?.();
+      return;
+    }
+    if (filters.every(isDataImageFilter)) {
+      const imageData = await imageDataForXObject(renderer, object);
+      if (imageData) {
+        const image = await createImageBitmap(imageData);
+        drawUnitImage(renderer, image, { smoothing: !isIndexedColorSpace(renderer.pdf.resolve(object.value.ColorSpace)) });
+        image.close?.();
+        return;
+      }
+    }
+    renderer.unsupported(`Do/Image/${filters.join("+") || "raw"}`);
+  } catch (error) {
+    renderer.unsupported("Do/ImageDecode");
+  }
+}
+
+function drawUnitImage(renderer, image, options = {}) {
+  const [a, b, c, d, e, f] = renderer.state.ctm;
+  const [canvasX, canvasY] = renderer.pagePoint(e, f);
+  const [xA, xB] = renderer.pageVector(a, b);
+  const [yA, yB] = renderer.pageVector(c, d);
+  renderer.context.save();
+  renderer.context.imageSmoothingEnabled = options.smoothing !== false;
+  renderer.context.transform(xA, xB, yA, yB, canvasX, canvasY);
+  renderer.context.transform(1, 0, 0, -1, 0, 1);
+  renderer.context.drawImage(image, 0, 0, 1, 1);
+  renderer.context.restore();
+}
+
+async function imageDataForXObject(renderer, object) {
+  const dictionary = object.value;
+  const width = Number(renderer.pdf.resolve(dictionary.Width));
+  const height = Number(renderer.pdf.resolve(dictionary.Height));
+  const bits = Number(renderer.pdf.resolve(dictionary.BitsPerComponent));
+  if (!Number.isFinite(width) || !Number.isFinite(height) || !Number.isFinite(bits)) {
+    return null;
+  }
+  const colorSpace = renderer.pdf.resolve(dictionary.ColorSpace);
+  const palette = await indexedColorPalette(renderer.pdf, colorSpace);
+  if (palette) {
+    const pixels = unpackIndexedSamples(applyImageDecodeParms(await renderer.pdf.decodeStream(object.stream.bytes, dictionary), dictionary, width, height), bits, width, height, dictionary.Decode);
+    const alpha = await imageAlphaForXObject(renderer, dictionary, width, height);
+    const imageData = new ImageData(width, height);
+    for (let pixelIndex = 0; pixelIndex < width * height; pixelIndex += 1) {
+      const color = palette.colors[pixels[pixelIndex]] || palette.colors[0] || [0, 0, 0];
+      const targetIndex = pixelIndex * 4;
+      imageData.data[targetIndex] = color[0];
+      imageData.data[targetIndex + 1] = color[1];
+      imageData.data[targetIndex + 2] = color[2];
+      imageData.data[targetIndex + 3] = alpha?.[pixelIndex] ?? 255;
+    }
+    return imageData;
+  }
+  if (bits !== 8) {
+    return null;
+  }
+  const pixels = applyImageDecodeParms(await renderer.pdf.decodeStream(object.stream.bytes, dictionary), dictionary, width, height);
+  const components = imageComponents(colorSpace, pixels.length, width, height);
+  if (![1, 3, 4].includes(components)) {
+    return null;
+  }
+  const expectedLength = width * height * components;
+  if (pixels.length < expectedLength) {
+    return null;
+  }
+  const alpha = await imageAlphaForXObject(renderer, dictionary, width, height);
+  const imageData = new ImageData(width, height);
+  for (let pixelIndex = 0; pixelIndex < width * height; pixelIndex += 1) {
+    const sourceIndex = pixelIndex * components;
+    const targetIndex = pixelIndex * 4;
+    const decoded = decodeImageComponents(pixels, sourceIndex, components, dictionary.Decode);
+    if (components === 1) {
+      const gray = decoded[0];
+      imageData.data[targetIndex] = gray;
+      imageData.data[targetIndex + 1] = gray;
+      imageData.data[targetIndex + 2] = gray;
+    } else if (components === 4) {
+      const [red, green, blue] = cmykToRgb(decoded[0], decoded[1], decoded[2], decoded[3]);
+      imageData.data[targetIndex] = red;
+      imageData.data[targetIndex + 1] = green;
+      imageData.data[targetIndex + 2] = blue;
+    } else {
+      imageData.data[targetIndex] = decoded[0];
+      imageData.data[targetIndex + 1] = decoded[1];
+      imageData.data[targetIndex + 2] = decoded[2];
+    }
+    imageData.data[targetIndex + 3] = alpha?.[pixelIndex] ?? 255;
+  }
+  return imageData;
+}
+
+async function imageAlphaForXObject(renderer, dictionary, width, height) {
+  const maskObject = renderer.pdf.objectFor(dictionary.SMask);
+  if (!maskObject?.stream) {
+    return null;
+  }
+  const mask = maskObject.value;
+  const maskWidth = Number(renderer.pdf.resolve(mask.Width));
+  const maskHeight = Number(renderer.pdf.resolve(mask.Height));
+  const bits = Number(renderer.pdf.resolve(mask.BitsPerComponent));
+  if (maskWidth !== width || maskHeight !== height || bits !== 8) {
+    return null;
+  }
+  const filters = normalizeFilters(renderer.pdf.resolve(mask.Filter));
+  if (!filters.every(isDataImageFilter)) {
+    return null;
+  }
+  const pixels = applyImageDecodeParms(await renderer.pdf.decodeStream(maskObject.stream.bytes, mask), mask, width, height);
+  const components = imageComponents(renderer.pdf.resolve(mask.ColorSpace), pixels.length, width, height);
+  if (components !== 1 || pixels.length < width * height) {
+    return null;
+  }
+  return pixels;
 }
 
 class PdfValueParser {
@@ -2463,7 +2488,7 @@ function parseCffFont(bytes) {
   const strings = stringIndex.objects.map((value) => bytesToBinaryString(value));
   const charset = readCffCharset(bytes, topDict.charset || 0, charStrings.length, strings);
   let localSubrs = [];
-  if (Array.isArray(topDict.Private)) {
+  if (ENABLE_EXPERIMENTAL_OUTLINES && Array.isArray(topDict.Private)) {
     const privateOffset = topDict.Private[1];
     const privateSize = topDict.Private[0];
     const privateDict = parseCffDict(bytes.slice(privateOffset, privateOffset + privateSize));
@@ -2907,7 +2932,7 @@ function glyphOutlineForCode(font, code) {
 
 function glyphOutlineForGlyph(font, glyph) {
   if (font.kind === "cff") {
-    return glyph.glyphName ? cffGlyphOutlineForName(font, glyph.glyphName) : null;
+    return ENABLE_EXPERIMENTAL_OUTLINES && glyph.glyphName ? cffGlyphOutlineForName(font, glyph.glyphName) : null;
   }
   return glyphOutlineForCode(font, glyph.code);
 }
