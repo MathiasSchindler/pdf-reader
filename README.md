@@ -4,7 +4,7 @@ This directory is a standalone home for the small dependency-free PDF reader tha
 
 The goal is to keep three things separate:
 
-- `src/pdf-lite.js`: the experimental PDF parser and canvas renderer.
+- `src/pdf-lite/`: the experimental PDF parser and canvas renderer source modules.
 - `src/reader-app.js`: the browser reader UI that loads documents and renders pages, including an optional PDF.js comparison view when `vendor/pdfjs/` is present.
 - comparison experiments beyond PDF.js pixel diffs: Meltdown raster comparisons and cumulative layer diagnostics. Those are intentionally not part of this runtime app.
 
@@ -15,6 +15,12 @@ Start a static server from this directory, then open:
 ```text
 ruby -run -e httpd . -p 8787
 http://localhost:8787/
+```
+
+Install the development dependency once before building distribution files:
+
+```text
+npm install
 ```
 
 By default, the reader loads `./samples.js`. The manifest includes one generated smoke-test PDF from `fixtures/` and references local PDFs below `pdf-files/` when that ignored corpus is present.
@@ -64,13 +70,62 @@ pdf-reader/
   src/
     reader-app.js
     pdf-lite.js
+    pdf-lite/
+      index.js
+      engine.js
+      global.js
+  dist/
+    pdf-lite.min.js
+    pdf-lite.global.min.js
 ```
 
 `index.html` is deliberately small. It only wires up the reader UI and loads the module app.
 
 `src/reader-app.js` owns application behavior: manifest loading, document selection, page-range parsing, scale changes, rendering pages to canvases, diagnostic PDF.js comparison rendering, and showing renderer audit information.
 
-`src/pdf-lite.js` is the renderer engine copied from the experiment. It should stay independent of the reader UI and should not know about Bundestag manifests, PDF.js, Meltdown, or quality comparison tools.
+`src/pdf-lite/index.js` is the public development entry point for the renderer. `src/pdf-lite/engine.js` contains the parser and canvas renderer implementation. `src/pdf-lite/global.js` is only an entry point for the script-tag distribution build. The top-level `src/pdf-lite.js` file is a compatibility re-export for older imports.
+
+The renderer source should stay independent of the reader UI and should not know about Bundestag manifests, PDF.js, Meltdown, or quality comparison tools.
+
+## Distribution Builds
+
+The source is developed as modules, but the distributable renderer is one minified JavaScript file. Build both supported distribution flavors with:
+
+```text
+npm run build
+```
+
+This writes:
+
+- `dist/pdf-lite.min.js`: an ESM bundle for `import` users.
+- `dist/pdf-lite.global.min.js`: a script-tag bundle that exposes `window.PdfLite`.
+
+Use the ESM bundle when the host page can load JavaScript modules:
+
+```html
+<canvas id="page"></canvas>
+<script type="module">
+  import { loadPdfLite } from "./dist/pdf-lite.min.js";
+
+  const pdf = await loadPdfLite("./example.pdf");
+  await pdf.renderPage(0, document.getElementById("page"), { scale: 1.5 });
+</script>
+```
+
+Use the global bundle when the host page wants a plain script tag:
+
+```html
+<canvas id="page"></canvas>
+<script src="./dist/pdf-lite.global.min.js"></script>
+<script>
+  (async () => {
+    const pdf = await PdfLite.load("./example.pdf");
+    await pdf.renderPage(0, document.getElementById("page"), { scale: 1.5 });
+  })();
+</script>
+```
+
+The UI, sample manifest, PDF.js comparator, and difference view are not bundled into either distribution file. The bundle contains the renderer API only.
 
 ## What Is Not Included
 

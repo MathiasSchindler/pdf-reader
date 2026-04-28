@@ -1,0 +1,13 @@
+{
+  "name": "pdf-reader",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "npm run build:esm && npm run build:global",
+    "build:esm": "esbuild src/pdf-lite/index.js --bundle --format=esm --minify --legal-comments=none --outfile=dist/pdf-lite.min.js",
+    "build:global": "esbuild src/pdf-lite/global.js --bundle --format=iife --minify --legal-comments=none --outfile=dist/pdf-lite.global.min.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

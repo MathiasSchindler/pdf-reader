@@ -1,4 +1,4 @@
-import { loadPdfLite } from "./pdf-lite.js";
+import { loadPdfLite } from "./pdf-lite/index.js";
 
 const defaultManifestPath = "./samples.js";
 const defaultPdfBasePath = "./pdf-files";

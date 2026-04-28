@@ -7,4 +7,5 @@ pdf-files/
 
 # Local editor/runtime noise
 .vscode/
+node_modules/
 *.log
