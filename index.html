@@ -148,6 +148,7 @@
     .showcase-stage {
       min-width: 0;
       overflow: auto;
+      overscroll-behavior: contain;
       padding: 12px;
       border: 1px solid #d5ddd2;
       border-radius: 8px;
@@ -307,22 +308,26 @@
     const pageCount = document.getElementById("showcase-page-count");
     const previousButton = document.getElementById("showcase-previous");
     const nextButton = document.getElementById("showcase-next");
+    const wheelDeltaPerPage = 90;
+    const maxWheelPages = 5;
     let pdf = null;
     let pageIndex = 0;
     let resizeTimer = 0;
+    let wheelTimer = 0;
+    let wheelDelta = 0;
     let isRendering = false;
 
     previousButton.disabled = true;
     nextButton.disabled = true;
     previousButton.addEventListener("click", () => renderShowcase(pageIndex - 1));
     nextButton.addEventListener("click", () => renderShowcase(pageIndex + 1));
-    canvas.addEventListener("wheel", (event) => {
+    stage.addEventListener("wheel", (event) => {
       if (!pdf || Math.abs(event.deltaY) < 8) return;
-      const nextPageIndex = pageIndex + (event.deltaY > 0 ? 1 : -1);
-      if (nextPageIndex < 0 || nextPageIndex >= pdf.pages.length) return;
+      const direction = event.deltaY > 0 ? 1 : -1;
+      if ((direction < 0 && pageIndex <= 0) || (direction > 0 && pageIndex >= pdf.pages.length - 1)) return;
       event.preventDefault();
-      if (isRendering) return;
-      renderShowcase(nextPageIndex);
+      wheelDelta += event.deltaY;
+      scheduleWheelNavigation();
     }, { passive: false });
 
     try {
@@ -356,6 +361,27 @@
       }
       isRendering = false;
       updateShowcaseControls();
+      if (Math.abs(wheelDelta) >= 8) {
+        scheduleWheelNavigation();
+      }
+    }
+
+    function scheduleWheelNavigation() {
+      if (wheelTimer) {
+        clearTimeout(wheelTimer);
+      }
+      wheelTimer = setTimeout(() => {
+        wheelTimer = 0;
+        consumeWheelNavigation();
+      }, 45);
+    }
+
+    function consumeWheelNavigation() {
+      if (!pdf || isRendering || Math.abs(wheelDelta) < 8) return;
+      const direction = wheelDelta > 0 ? 1 : -1;
+      const pageSteps = Math.min(maxWheelPages, Math.max(1, Math.floor(Math.abs(wheelDelta) / wheelDeltaPerPage)));
+      wheelDelta = 0;
+      renderShowcase(pageIndex + direction * pageSteps);
     }
 
     function updateShowcaseControls() {
