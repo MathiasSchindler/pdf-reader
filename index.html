@@ -20,6 +20,7 @@
       margin: 0;
       min-height: 100vh;
       display: grid;
+      grid-template-columns: minmax(0, 1fr);
       grid-template-rows: auto 1fr auto;
     }
 
@@ -87,6 +88,7 @@
 
     main {
       display: grid;
+      grid-template-columns: minmax(0, 1fr);
       gap: 22px;
       align-content: start;
     }
@@ -154,11 +156,50 @@
 
     .showcase-stage canvas {
       display: block;
+      width: 100%;
       max-width: 100%;
       height: auto;
       margin: 0 auto;
       background: #ffffff;
       box-shadow: 0 2px 18px rgba(22, 34, 24, 0.16);
+    }
+
+    .showcase-controls {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .showcase-controls button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 36px;
+      height: 36px;
+      border: 1px solid #a8b0a5;
+      border-radius: 999px;
+      background: #ffffff;
+      color: #1f4d3a;
+      font: inherit;
+      font-size: 20px;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    .showcase-controls button:disabled {
+      color: #a0a79d;
+      cursor: default;
+      opacity: 0.55;
+    }
+
+    .showcase-page-count {
+      min-width: 76px;
+      color: #343d35;
+      font-size: 14px;
+      font-variant-numeric: tabular-nums;
+      text-align: center;
     }
 
     .showcase-status {
@@ -170,6 +211,17 @@
 
     .showcase-status.error {
       color: #9b1c1c;
+    }
+
+    .showcase-credit {
+      margin: 8px 0 0;
+      color: #5c6459;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .showcase-credit a {
+      color: #1f4d3a;
     }
 
     @media (max-width: 760px) {
@@ -191,10 +243,9 @@
     <p class="intro">A small experimental PDF renderer for the browser. It parses PDF objects and content streams directly, paints pages to canvas, and ships as a single minified JavaScript file for simple embedding.</p>
     <nav class="actions" aria-label="Project links">
       <a class="button primary" href="./dist/demo/">Open Demo</a>
+      <a class="button" href="./dist/pdf-crumb-dist.zip" download>Download</a>
       <a class="button" href="./dev/">Development Reader</a>
-      <a class="button" href="./README.md">Readme</a>
-      <a class="button" href="./LICENSE">CC0 License</a>
-      <a class="button" href="./THIRD_PARTY_NOTICES.md">Notices</a>
+      <a class="button" href="https://creativecommons.org/publicdomain/zero/1.0/">CC0 License</a>
     </nav>
   </header>
 
@@ -207,7 +258,13 @@
       </div>
       <div class="showcase-stage" id="showcase-stage">
         <canvas id="showcase-canvas" aria-label="Rendered first page of the PDF article"></canvas>
+        <div class="showcase-controls" aria-label="PDF page controls">
+          <button id="showcase-previous" type="button" aria-label="Previous page">&larr;</button>
+          <span class="showcase-page-count" id="showcase-page-count">Page - / -</span>
+          <button id="showcase-next" type="button" aria-label="Next page">&rarr;</button>
+        </div>
         <p class="showcase-status" id="showcase-status">Loading PDF showcase...</p>
+        <p class="showcase-credit">Source document: English Wikipedia article <a href="https://en.wikipedia.org/wiki/PDF">"PDF"</a>. See the article history for authors and CC BY-SA license terms.</p>
       </div>
     </section>
 
@@ -247,8 +304,25 @@
     const canvas = document.getElementById("showcase-canvas");
     const stage = document.getElementById("showcase-stage");
     const status = document.getElementById("showcase-status");
+    const pageCount = document.getElementById("showcase-page-count");
+    const previousButton = document.getElementById("showcase-previous");
+    const nextButton = document.getElementById("showcase-next");
     let pdf = null;
+    let pageIndex = 0;
     let resizeTimer = 0;
+    let isRendering = false;
+
+    previousButton.disabled = true;
+    nextButton.disabled = true;
+    previousButton.addEventListener("click", () => renderShowcase(pageIndex - 1));
+    nextButton.addEventListener("click", () => renderShowcase(pageIndex + 1));
+    canvas.addEventListener("wheel", (event) => {
+      if (!pdf || isRendering || Math.abs(event.deltaY) < 8) return;
+      const nextPageIndex = pageIndex + (event.deltaY > 0 ? 1 : -1);
+      if (nextPageIndex < 0 || nextPageIndex >= pdf.pages.length) return;
+      event.preventDefault();
+      renderShowcase(nextPageIndex);
+    }, { passive: false });
 
     try {
       pdf = await loadPdfCrumb("./pdf-files/PDF.pdf");
@@ -262,19 +336,40 @@
       status.classList.add("error");
     }
 
-    async function renderShowcase() {
-      if (!pdf) return;
-      status.textContent = "Rendering first page...";
+    async function renderShowcase(nextPageIndex = pageIndex) {
+      if (!pdf || isRendering) return;
+      pageIndex = Math.min(Math.max(nextPageIndex, 0), pdf.pages.length - 1);
+      isRendering = true;
+      updateShowcaseControls();
+      status.textContent = `Rendering page ${pageIndex + 1}...`;
       status.classList.remove("error");
       const availableWidth = Math.max(260, stage.clientWidth - 24);
-      const scale = Math.min(1.15, Math.max(0.45, availableWidth / 612));
+      const pageWidth = pageDisplayWidth(pdf.pages[pageIndex]);
+      const scale = Math.min(1.15, Math.max(0.2, availableWidth / pageWidth));
       try {
-        await pdf.renderPage(0, canvas, { scale });
-        status.textContent = `${pdf.pages.length} pages · first page rendered with pdf-crumb.js`;
+        await pdf.renderPage(pageIndex, canvas, { scale });
+        status.textContent = `${pdf.pages.length} pages · rendered with pdf-crumb.js`;
       } catch (error) {
         status.textContent = error.message;
         status.classList.add("error");
       }
+      isRendering = false;
+      updateShowcaseControls();
+    }
+
+    function updateShowcaseControls() {
+      const pageTotal = pdf?.pages.length || 0;
+      pageCount.textContent = pageTotal ? `Page ${pageIndex + 1} / ${pageTotal}` : "Page - / -";
+      previousButton.disabled = isRendering || !pageTotal || pageIndex <= 0;
+      nextButton.disabled = isRendering || !pageTotal || pageIndex >= pageTotal - 1;
+    }
+
+    function pageDisplayWidth(page) {
+      const box = page?.cropBox || page?.mediaBox || [0, 0, 612, 792];
+      const width = Math.abs(box[2] - box[0]);
+      const height = Math.abs(box[3] - box[1]);
+      const rotation = ((page?.rotate || 0) % 360 + 360) % 360;
+      return rotation === 90 || rotation === 270 ? height : width;
     }
   </script>
 </body>
