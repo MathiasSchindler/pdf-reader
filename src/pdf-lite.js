@@ -1,1 +1,1 @@
-export { loadPdfLite } from "./pdf-lite/index.js";
+export { loadPdfCrumb, loadPdfLite } from "./pdf-lite/index.js";

@@ -1,6 +1,8 @@
 {
-  "name": "pdf-reader",
-  "private": true,
+  "name": "pdf-crumb",
+  "version": "0.1.0",
+  "description": "A tiny dependency-free browser PDF renderer experiment.",
+  "license": "CC0-1.0",
   "type": "module",
   "scripts": {
     "build": "node scripts/build.js",

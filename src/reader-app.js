@@ -1,7 +1,7 @@
 import { loadPdfLite } from "./pdf-lite/index.js";
 
-const defaultManifestPath = "./samples.js";
-const defaultPdfBasePath = "./pdf-files";
+const defaultManifestPath = new URL("../samples.js", import.meta.url).href;
+const defaultPdfBasePath = new URL("../pdf-files", import.meta.url).href;
 
 const documentSelect = document.getElementById("document-select");
 const scaleInput = document.getElementById("scale-input");
@@ -72,7 +72,7 @@ async function loadDocuments() {
   const manifest = Function(`${source}; return typeof BT_DRUCKSACHEN !== "undefined" ? BT_DRUCKSACHEN : [];`)();
   return manifest.map((document) => ({
     ...document,
-    pdfUrl: document.pdfUrl || joinUrlPath(pdfBasePath, document.pdfPath),
+    pdfUrl: document.pdfUrl ? resolveUrl(document.pdfUrl, manifestPath) : joinUrlPath(pdfBasePath, document.pdfPath),
   }));
 }
 
@@ -323,7 +323,7 @@ async function loadPdfJsModule() {
 }
 
 function viewModeLabel(mode) {
-  return ({ lite: "pdf-lite", pdfjs: "PDF.js", diff: "difference" })[mode] || mode;
+  return ({ lite: "pdf-crumb", pdfjs: "PDF.js", diff: "difference" })[mode] || mode;
 }
 
 function fontModeLabel(mode) {
@@ -383,6 +383,14 @@ function formatUnsupported(operators) {
 
 function joinUrlPath(base, path) {
   return `${String(base || "").replace(/\/$/, "")}/${String(path || "").replace(/^\//, "")}`;
+}
+
+function resolveUrl(path, base) {
+  try {
+    return new URL(path, base).href;
+  } catch {
+    return path;
+  }
 }
 
 function setStatus(message, isError = false) {

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>pdf-lite demo</title>
+  <title>pdf-crumb.js demo</title>
   <style>
     :root {
       color-scheme: light;
@@ -126,7 +126,7 @@
 </head>
 <body>
   <header>
-    <h1>pdf-lite</h1>
+    <h1>pdf-crumb.js</h1>
     <button id="sample-button" type="button">Sample</button>
     <label class="file-button" for="file-input">Open PDF</label>
     <input id="file-input" type="file" accept="application/pdf,.pdf">
@@ -144,7 +144,7 @@
   </main>
 
   <script type="module">
-    import { loadPdfLite } from "../pdf-lite.viewer.min.js";
+    import { loadPdfCrumb } from "../pdf-crumb.viewer.min.js";
 
     const sampleUrl = "./sample.pdf";
     const canvas = document.getElementById("page-canvas");
@@ -197,7 +197,7 @@
     async function loadDocument(url, label) {
       setStatus(`Loading ${label}...`);
       try {
-        pdf = await loadPdfLite(url);
+        pdf = await loadPdfCrumb(url);
         pageIndex = 0;
         await renderPage(0);
       } catch (error) {

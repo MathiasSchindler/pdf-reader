@@ -1,6 +1,9 @@
-import { loadPdfLite } from "./index.js";
+import { loadPdfCrumb, loadPdfLite } from "./index.js";
 
-globalThis.PdfLite = Object.freeze({
-  load: loadPdfLite,
+globalThis.PdfCrumb = Object.freeze({
+  load: loadPdfCrumb,
+  loadPdfCrumb,
   loadPdfLite,
 });
+
+globalThis.PdfLite ||= globalThis.PdfCrumb;

@@ -31,8 +31,8 @@ const profiles = [
 ];
 
 const formats = [
-  { name: "esm", entry: "src/pdf-lite/index.js", outfile: (profile) => `dist/pdf-lite${profile.suffix}.min.js`, format: "esm" },
-  { name: "global", entry: "src/pdf-lite/global.js", outfile: (profile) => `dist/pdf-lite${profile.suffix}.global.min.js`, format: "iife" },
+  { name: "esm", entry: "src/pdf-lite/index.js", outfile: (profile) => `dist/pdf-crumb${profile.suffix}.min.js`, format: "esm" },
+  { name: "global", entry: "src/pdf-lite/global.js", outfile: (profile) => `dist/pdf-crumb${profile.suffix}.global.min.js`, format: "iife" },
 ];
 
 await mkdir("dist", { recursive: true });
