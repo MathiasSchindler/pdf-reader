@@ -12,3 +12,4 @@ pdf-files/*
 .vscode/
 node_modules/
 *.log
+fuzz/artifacts/

@@ -1238,37 +1238,38 @@ class PdfValueParser {
   parseAtomOrReference() {
     const first = this.readAtom();
     const firstNumber = Number(first);
+    if (!Number.isFinite(firstNumber)) {
+      if (first === "true") {
+        return true;
+      }
+      if (first === "false") {
+        return false;
+      }
+      if (first === "null") {
+        return null;
+      }
+      return first;
+    }
     const checkpoint = this.position;
     this.skipWhitespace();
     const second = this.readAtom();
     const secondNumber = Number(second);
-    const afterSecond = this.position;
     this.skipWhitespace();
     if (Number.isFinite(firstNumber) && Number.isFinite(secondNumber) && this.source[this.position] === "R") {
       this.position += 1;
       return { ref: firstNumber, generation: secondNumber };
     }
     this.position = checkpoint;
-    if (first === "true") {
-      return true;
-    }
-    if (first === "false") {
-      return false;
-    }
-    if (first === "null") {
-      return null;
-    }
-    if (Number.isFinite(firstNumber)) {
-      return firstNumber;
-    }
-    this.position = afterSecond;
-    return first;
+    return firstNumber;
   }
 
   readAtom() {
     this.skipWhitespace();
     const start = this.position;
     while (this.position < this.source.length && !isPdfDelimiter(this.source.charCodeAt(this.position))) {
+      this.position += 1;
+    }
+    if (this.position === start && this.position < this.source.length) {
       this.position += 1;
     }
     return this.source.slice(start, this.position);

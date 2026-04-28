@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "build": "node scripts/build.js",
+    "fuzz": "node fuzz/pdf-fuzz.js --mode=full",
+    "fuzz:smoke": "node fuzz/pdf-fuzz.js --mode=smoke",
     "size": "node scripts/build.js"
   },
   "devDependencies": {
