@@ -9,10 +9,13 @@
     "fuzz": "node fuzz/pdf-fuzz.js --mode=full",
     "fuzz:smoke": "node fuzz/pdf-fuzz.js --mode=smoke",
     "fuzz:epic": "node fuzz/pdf-fuzz.js --mode=epic",
+    "fuzz:render": "node fuzz/render-fuzz.js",
+    "fuzz:oracle": "node fuzz/oracle-fuzz.js",
     "size": "node scripts/build.js"
   },
   "devDependencies": {
     "esbuild": "^0.25.0",
+    "playwright": "^1.59.1",
     "terser": "^5.46.2"
   }
 }

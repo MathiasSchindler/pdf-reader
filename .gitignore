@@ -13,3 +13,5 @@ pdf-files/*
 node_modules/
 *.log
 fuzz/artifacts/
+fuzz/artifacts-render/
+fuzz/artifacts-oracle/

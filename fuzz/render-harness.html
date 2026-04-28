@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>pdf-crumb render fuzz harness</title>
+</head>
+<body>
+<canvas id="c" width="800" height="1000"></canvas>
+<script type="module">
+import { loadPdfCrumb } from "/src/pdf-lite/index.js";
+
+window.__renderCase = async (base64) => {
+  const url = `data:application/pdf;base64,${base64}`;
+  const pdf = await loadPdfCrumb(url);
+  const canvas = document.getElementById("c");
+  const result = { pages: pdf.pages?.length || 0, rendered: 0, unsupported: 0 };
+  const limit = Math.min(pdf.pages?.length || 0, 4);
+  for (let i = 0; i < limit; i += 1) {
+    const out = await pdf.renderPage(i, canvas, { scale: 1 });
+    result.rendered += 1;
+    result.unsupported += out?.unsupportedOperators?.size || 0;
+  }
+  return result;
+};
+
+window.__ready = true;
+</script>
+</body>
+</html>

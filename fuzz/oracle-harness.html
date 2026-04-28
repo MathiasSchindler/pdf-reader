@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>pdf-crumb cross-validation oracle</title>
+</head>
+<body>
+<canvas id="c" width="800" height="1000"></canvas>
+<script type="module">
+import { loadPdfCrumb } from "/src/pdf-lite/index.js";
+import { getDocument, GlobalWorkerOptions } from "/vendor/pdfjs/pdf.mjs";
+
+GlobalWorkerOptions.workerSrc = "/vendor/pdfjs/pdf.worker.mjs";
+
+window.__oracleCase = async (base64) => {
+  const url = `data:application/pdf;base64,${base64}`;
+  const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+
+  const ours = await runOurs(url);
+  const theirs = await runPdfJs(bytes);
+  return { ours, theirs };
+};
+
+async function runOurs(url) {
+  try {
+    const pdf = await loadPdfCrumb(url);
+    return { status: "ok", pages: pdf.pages?.length || 0 };
+  } catch (error) {
+    return { status: "rejected", message: String(error?.message || error) };
+  }
+}
+
+async function runPdfJs(bytes) {
+  try {
+    const task = getDocument({
+      data: bytes,
+      disableAutoFetch: true,
+      disableStream: true,
+      isEvalSupported: false,
+      stopAtErrors: true,
+    });
+    const pdf = await task.promise;
+    const pages = pdf.numPages;
+    await pdf.destroy();
+    return { status: "ok", pages };
+  } catch (error) {
+    return { status: "rejected", message: String(error?.message || error) };
+  }
+}
+
+window.__ready = true;
+</script>
+</body>
+</html>

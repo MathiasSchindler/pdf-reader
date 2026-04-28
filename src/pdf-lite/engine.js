@@ -11,6 +11,17 @@ const ENABLE_DIAGNOSTICS = typeof PDF_LITE_DIAGNOSTICS === "boolean" ? PDF_LITE_
 const ENABLE_EXPERIMENTAL_OUTLINES = typeof PDF_LITE_EXPERIMENTAL_OUTLINES === "boolean" ? PDF_LITE_EXPERIMENTAL_OUTLINES : true;
 const ENABLE_IMAGES = typeof PDF_LITE_IMAGES === "boolean" ? PDF_LITE_IMAGES : true;
 
+// --- Defensive limits -------------------------------------------------------
+// Generous caps that real PDFs never approach but that keep pathological or
+// adversarial inputs bounded. These turn would-be hangs and runaway
+// allocations into fast, deterministic errors.
+const MAX_OBJECTS = 200_000;
+const MAX_PAGES = 10_000;
+const MAX_PAGE_DEPTH = 64;
+const MAX_PAGE_KIDS = 8192;
+const MAX_PAGE_DIMENSION_PX = 16384; // upper bound on canvas width/height
+const MAX_CONTENT_STREAM_BYTES = 64 * 1024 * 1024; // combined per page
+
 export async function loadPdfLite(url) {
   const response = await fetch(url);
   if (!response.ok) {
@@ -19,6 +30,18 @@ export async function loadPdfLite(url) {
   const bytes = new Uint8Array(await response.arrayBuffer());
   const pdf = new PdfLiteDocument(bytes, url);
   await pdf.parse();
+  // Reject obviously broken files that parsed to nothing useful. These are
+  // structural minimums; any real PDF clears them trivially. Rejecting here
+  // gives callers a clear error instead of an empty 0-page document.
+  if (!pdf.source.includes("%PDF-")) {
+    throw new Error("Invalid PDF: missing %PDF- header.");
+  }
+  if (pdf.objects.size === 0) {
+    throw new Error("Invalid PDF: no objects could be parsed.");
+  }
+  if (pdf.pages.length === 0) {
+    throw new Error("Invalid PDF: no pages found.");
+  }
   return pdf;
 }
 
@@ -117,14 +140,22 @@ class PdfLiteDocument {
     const scale = options.scale || 1;
     const mediaBox = page.mediaBox || [0, 0, 595, 842];
     const pageBox = page.cropBox || mediaBox;
-    const boxWidth = Math.abs(pageBox[2] - pageBox[0]);
-    const boxHeight = Math.abs(pageBox[3] - pageBox[1]);
+    const rawWidth = Math.abs(pageBox[2] - pageBox[0]);
+    const rawHeight = Math.abs(pageBox[3] - pageBox[1]);
+    // Reject pathologically tiny or NaN boxes; clamp huge ones so we never
+    // attempt a multi-gigapixel canvas allocation.
+    const safeWidth = clampDimension(rawWidth, 595);
+    const safeHeight = clampDimension(rawHeight, 842);
     const rotation = normalizeRotation(page.rotate);
+    const boxWidth = safeWidth;
+    const boxHeight = safeHeight;
     const width = rotation === 90 || rotation === 270 ? boxHeight : boxWidth;
     const height = rotation === 90 || rotation === 270 ? boxWidth : boxHeight;
     const pixelRatio = window.devicePixelRatio || 1;
-    canvas.width = Math.floor(width * scale * pixelRatio);
-    canvas.height = Math.floor(height * scale * pixelRatio);
+    const pixelWidth = Math.min(MAX_PAGE_DIMENSION_PX, Math.max(1, Math.floor(width * scale * pixelRatio)));
+    const pixelHeight = Math.min(MAX_PAGE_DIMENSION_PX, Math.max(1, Math.floor(height * scale * pixelRatio)));
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
     canvas.style.width = `${Math.floor(width * scale)}px`;
     canvas.style.height = `${Math.floor(height * scale)}px`;
     const context = canvas.getContext("2d");
@@ -133,7 +164,17 @@ class PdfLiteDocument {
     context.fillRect(0, 0, width * scale, height * scale);
     const renderer = new ContentRenderer(this, page, context, { scale, width, height, boxWidth, boxHeight, rotation, originX: pageBox[0], originY: pageBox[1], fontMode: options.fontMode || "stable" });
     const streams = await this.getPageContentStreams(page);
-    await renderer.interpret(streams.map((stream) => bytesToBinaryString(stream)).join("\n"));
+    let totalBytes = 0;
+    const safeStreams = [];
+    for (const stream of streams) {
+      totalBytes += stream.length;
+      if (totalBytes > MAX_CONTENT_STREAM_BYTES) {
+        if (ENABLE_DIAGNOSTICS) this.warnings.push(`Content stream truncated at ${MAX_CONTENT_STREAM_BYTES} bytes for page ${index + 1}.`);
+        break;
+      }
+      safeStreams.push(stream);
+    }
+    await renderer.interpret(safeStreams.map((stream) => bytesToBinaryString(stream)).join("\n"));
     return { unsupportedOperators: ENABLE_DIAGNOSTICS ? renderer.unsupportedOperators : new Map() };
   }
 
@@ -141,6 +182,10 @@ class PdfLiteDocument {
     const objectPattern = /(\d+)\s+(\d+)\s+obj\b/g;
     let match;
     while ((match = objectPattern.exec(this.source))) {
+      if (this.objects.size >= MAX_OBJECTS) {
+        if (ENABLE_DIAGNOSTICS) this.warnings.push(`Object limit reached (${MAX_OBJECTS}); ignoring remaining objects.`);
+        break;
+      }
       const id = Number(match[1]);
       const generation = Number(match[2]);
       const start = match.index + match[0].length;
@@ -195,12 +240,26 @@ class PdfLiteDocument {
     const catalog = Array.from(this.objects.values()).find((object) => object.value?.Type === "Catalog")?.value;
     const pagesRoot = this.resolve(catalog?.Pages);
     this.pages = [];
-    this.walkPages(pagesRoot, {});
+    this.walkPages(pagesRoot, {}, 0, new Set());
   }
 
-  walkPages(node, inherited) {
+  walkPages(node, inherited, depth = 0, visited = new Set()) {
     if (!node) {
       return;
+    }
+    if (depth > MAX_PAGE_DEPTH) {
+      if (ENABLE_DIAGNOSTICS) this.warnings.push(`Page tree depth limit (${MAX_PAGE_DEPTH}) reached.`);
+      return;
+    }
+    if (this.pages.length >= MAX_PAGES) {
+      return;
+    }
+    if (typeof node === "object" && node !== null) {
+      if (visited.has(node)) {
+        if (ENABLE_DIAGNOSTICS) this.warnings.push("Cycle detected in page tree; bailing out of branch.");
+        return;
+      }
+      visited.add(node);
     }
     const nextInherited = {
       resources: this.resolve(node.Resources) || inherited.resources,
@@ -220,8 +279,13 @@ class PdfLiteDocument {
       return;
     }
     const kids = this.resolve(node.Kids) || [];
-    for (const kid of kids) {
-      this.walkPages(this.resolve(kid), nextInherited);
+    const limit = Math.min(kids.length, MAX_PAGE_KIDS);
+    if (kids.length > MAX_PAGE_KIDS && ENABLE_DIAGNOSTICS) {
+      this.warnings.push(`Page kids array truncated from ${kids.length} to ${MAX_PAGE_KIDS}.`);
+    }
+    for (let index = 0; index < limit; index += 1) {
+      if (this.pages.length >= MAX_PAGES) break;
+      this.walkPages(this.resolve(kids[index]), nextInherited, depth + 1, visited);
     }
   }
 
@@ -1602,6 +1666,14 @@ function fontCodeByteWidths(toUnicode, isCidFont) {
 function normalizeRotation(value) {
   const rotation = Number(value) || 0;
   return ((rotation % 360) + 360) % 360;
+}
+
+function clampDimension(value, fallback) {
+  // Reject NaN/Infinity/non-positive box sides and clamp to a generous upper
+  // bound. PDF user-space units cap; canvas pixel clamp is applied separately.
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  if (value > 1_000_000) return fallback;
+  return value;
 }
 
 async function indexedColorPalette(pdf, colorSpace) {
