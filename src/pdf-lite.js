@@ -54,13 +54,45 @@ class PdfLiteDocument {
         name: font.resourceName,
         subtype: font.subtype,
         baseFont: font.baseFont,
+        hasEmbeddedFont: font.hasEmbeddedFont,
+        embeddedFontFormat: font.embeddedFontFormat,
+        embeddedFontLoaded: font.embeddedFontLoaded,
+        embeddedFontError: font.embeddedFontError,
+        embeddedOutlineLoaded: font.embeddedOutlineLoaded,
+        embeddedOutlineUsable: font.embeddedOutlineUsable,
+        embeddedOutlineExperimental: font.embeddedOutlineExperimental,
         hasToUnicode: Boolean(font.toUnicode),
         cmapEntries: font.toUnicode?.size || 0,
         hasWidths: font.widths.size > 0,
         defaultWidth: font.defaultWidth,
       })),
+      images: this.imageAudit(),
       warnings: this.warnings,
     };
+  }
+
+  imageAudit() {
+    return Array.from(this.objects.values())
+      .filter((object) => object.value?.Subtype === "Image")
+      .map((object) => ({
+        object: object.id,
+        width: this.resolve(object.value.Width),
+        height: this.resolve(object.value.Height),
+        bitsPerComponent: this.resolve(object.value.BitsPerComponent),
+        filters: normalizeFilters(this.resolve(object.value.Filter)),
+        colorSpace: colorSpaceLabel(this.resolveColorSpace(object.value.ColorSpace)),
+        hasMask: Boolean(object.value.Mask),
+        hasSoftMask: Boolean(object.value.SMask),
+        imageMask: Boolean(object.value.ImageMask),
+      }));
+  }
+
+  resolveColorSpace(value) {
+    const colorSpace = this.resolve(value);
+    if (Array.isArray(colorSpace)) {
+      return colorSpace.map((part, index) => index === 0 ? part : this.resolve(part));
+    }
+    return colorSpace;
   }
 
   async renderPage(index, canvas, options = {}) {
@@ -85,7 +117,7 @@ class PdfLiteDocument {
     context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
     context.fillStyle = "#fff";
     context.fillRect(0, 0, width * scale, height * scale);
-    const renderer = new ContentRenderer(this, page, context, { scale, width, height, boxWidth, boxHeight, rotation, originX: pageBox[0], originY: pageBox[1] });
+    const renderer = new ContentRenderer(this, page, context, { scale, width, height, boxWidth, boxHeight, rotation, originX: pageBox[0], originY: pageBox[1], fontMode: options.fontMode || "stable" });
     const streams = await this.getPageContentStreams(page);
     await renderer.interpret(streams.map((stream) => bytesToBinaryString(stream)).join("\n"));
     return { unsupportedOperators: renderer.unsupportedOperators };
@@ -200,21 +232,66 @@ class PdfLiteDocument {
           }
         }
         const descendantFont = Array.isArray(font.DescendantFonts) ? this.resolve(font.DescendantFonts[0]) : null;
+        const descriptor = this.resolve(font.FontDescriptor) || this.resolve(descendantFont?.FontDescriptor) || null;
+        const embeddedFont = await this.loadEmbeddedFont(resourceName, font, descendantFont, descriptor);
         const metrics = buildFontMetrics(font, descendantFont, toUnicode);
+        await installEmbeddedBrowserFont(embeddedFont, metrics, toUnicode);
+        const embeddedOutlineUsable = Boolean(embeddedFont?.outlineFont && embeddedFont.outlineFont.kind !== "cff" && !metrics.isCidFont && toUnicode?.size);
+        const embeddedOutlineExperimental = Boolean(embeddedFont?.outlineFont?.kind === "cff" && !metrics.isCidFont && toUnicode?.size);
         this.fonts.set(objectId, {
           objectId,
           resourceName,
           subtype: font.Subtype || "unknown",
           baseFont: font.BaseFont || "unknown",
+          hasEmbeddedFont: Boolean(embeddedFont),
+          embeddedFontFamily: embeddedFont?.family || null,
+          embeddedFontFormat: embeddedFont?.format || null,
+          embeddedFontLoaded: Boolean(embeddedFont?.loaded),
+          embeddedFontError: embeddedFont?.error || null,
+          embeddedOutlineFont: embeddedFont?.outlineFont || null,
+          embeddedOutlineLoaded: Boolean(embeddedFont?.outlineFont),
+          embeddedOutlineUsable,
+          embeddedOutlineExperimental,
           toUnicode,
           widths: metrics.widths,
           defaultWidth: metrics.defaultWidth,
           hasExplicitDefaultWidth: metrics.hasExplicitDefaultWidth,
           codeByteWidths: metrics.codeByteWidths,
+          codeToGlyphName: metrics.codeToGlyphName,
           isCidFont: metrics.isCidFont,
         });
       }
     }
+  }
+
+  async loadEmbeddedFont(resourceName, font, descendantFont, descriptor) {
+    const entry = embeddedFontEntry(descriptor);
+    if (!entry) {
+      return null;
+    }
+    const object = this.objectFor(entry.ref);
+    if (!object?.stream) {
+      return null;
+    }
+    const format = entry.format === "fontfile3" ? object.value.Subtype || entry.format : entry.format;
+    const family = `PdfLite-${resourceName}-${object.id}`;
+    const embedded = { family, format, loaded: false, error: null, outlineFont: null, bytes: null };
+    let bytes;
+    try {
+      bytes = await this.decodeStream(object.stream.bytes, object.value);
+      embedded.bytes = bytes;
+      if (format === "truetype") {
+        embedded.outlineFont = parseTrueTypeFont(bytes);
+      } else if (format === "Type1C") {
+        embedded.outlineFont = parseCffFont(bytes);
+        embedded.error = "Type1C/CFF outlines are parsed for diagnostics but not painted yet";
+      }
+    } catch (error) {
+      embedded.error = error.message;
+      return embedded;
+    }
+    embedded.error ||= embedded.outlineFont?.browserInstallableError || null;
+    return embedded;
   }
 
   async getPageContentStreams(page) {
@@ -278,6 +355,7 @@ class ContentRenderer {
     this.rotation = metrics.rotation || 0;
     this.originX = metrics.originX || 0;
     this.originY = metrics.originY || 0;
+    this.fontMode = metrics.fontMode || "stable";
     this.stack = [];
     this.state = this.defaultState();
     this.unsupportedOperators = new Map();
@@ -572,7 +650,7 @@ class ContentRenderer {
     let advance;
     let advanceIncludesSpacing = false;
     if (glyphs.some((glyph) => Number.isFinite(glyph.width))) {
-      advance = this.paintGlyphRun(glyphs, unitScale);
+      advance = this.paintGlyphRun(glyphs, unitScale, fontSize);
       advanceIncludesSpacing = true;
     } else {
       this.paintText(text, 0, 0);
@@ -582,15 +660,54 @@ class ContentRenderer {
     this.advanceText(advanceIncludesSpacing ? advance * this.state.horizontalScale : this.textAdvance(text, advance));
   }
 
-  paintGlyphRun(glyphs, unitScale) {
+  paintGlyphRun(glyphs, unitScale, fontSize) {
+    const font = this.currentFont();
     let x = 0;
     for (const glyph of glyphs) {
       if (glyph.text) {
-        this.paintText(glyph.text, x * unitScale, 0);
+        if (!this.paintEmbeddedGlyph(font, glyph, x * unitScale, fontSize)) {
+          this.paintText(glyph.text, x * unitScale, 0);
+        }
       }
       x += this.glyphAdvance(glyph, unitScale) + this.spacingAdvance(glyph.text);
     }
     return x;
+  }
+
+  paintEmbeddedGlyph(font, glyph, x, fontSize) {
+    const outlineFont = font?.embeddedOutlineFont;
+    if (!outlineFont || !this.canPaintEmbeddedGlyph(font, outlineFont) || !Number.isFinite(glyph.code)) {
+      return false;
+    }
+    const outline = glyphOutlineForGlyph(outlineFont, glyph);
+    if (!outline) {
+      return false;
+    }
+    const scale = fontSize / outlineFont.unitsPerEm;
+    const mode = this.state.textRenderingMode;
+    const paintMode = mode >= 4 ? mode - 4 : mode;
+    if (mode >= 4) {
+      this.unsupported("Tr/TextClip");
+    }
+    this.context.beginPath();
+    appendGlyphPath(this.context, outline, x, scale, fontSize, outlineFont);
+    if (paintMode === 0 || paintMode === 2) {
+      this.context.fill();
+    }
+    if (paintMode === 1 || paintMode === 2) {
+      const previousAlpha = this.context.globalAlpha;
+      this.context.globalAlpha = this.state.strokeAlpha;
+      this.context.stroke();
+      this.context.globalAlpha = previousAlpha;
+    }
+    return true;
+  }
+
+  canPaintEmbeddedGlyph(font, outlineFont) {
+    if (this.fontMode === "embedded") {
+      return Boolean(!font.isCidFont && font.toUnicode?.size && outlineFont.kind !== "truetype-cid");
+    }
+    return Boolean(font.embeddedOutlineUsable);
   }
 
   paintText(text, x, y) {
@@ -1164,7 +1281,7 @@ function extractStream(source, bytes, objectStart, objectEnd, dictionary) {
   } else if (source[dataStart] === "\n" || source[dataStart] === "\r") {
     dataStart += 1;
   }
-  const declaredLength = Number(dictionary.Length);
+  const declaredLength = streamLength(source, dictionary.Length);
   let dataEnd = Number.isFinite(declaredLength) && declaredLength > 0 ? dataStart + declaredLength : source.indexOf("endstream", dataStart);
   if (dataEnd < 0 || dataEnd > objectEnd) {
     return null;
@@ -1175,6 +1292,18 @@ function extractStream(source, bytes, objectStart, objectEnd, dictionary) {
     }
   }
   return { bytes: bytes.slice(dataStart, dataEnd) };
+}
+
+function streamLength(source, value) {
+  if (typeof value === "number") {
+    return value;
+  }
+  if (!value?.ref) {
+    return Number(value);
+  }
+  const pattern = new RegExp(`\\b${value.ref}\\s+${value.generation || 0}\\s+obj\\s+([+-]?(?:\\d+\\.?\\d*|\\.\\d+))\\s+endobj\\b`);
+  const match = source.match(pattern);
+  return match ? Number(match[1]) : NaN;
 }
 
 function tokenizeContent(source) {
@@ -1336,6 +1465,7 @@ function buildFontMetrics(font, descendantFont, toUnicode) {
     defaultWidth: Number.isFinite(explicitDefaultWidth) ? explicitDefaultWidth : isCidFont ? 1000 : 500,
     hasExplicitDefaultWidth: Number.isFinite(explicitDefaultWidth),
     codeByteWidths: fontCodeByteWidths(toUnicode, isCidFont),
+    codeToGlyphName: isCidFont ? new Map() : fontEncodingMap(font.Encoding),
     isCidFont,
   };
 }
@@ -1384,6 +1514,57 @@ function cidWidthMap(widths) {
   }
   return map;
 }
+
+function fontEncodingMap(encoding) {
+  const map = new Map();
+  for (let code = 0; code < 256; code += 1) {
+    const name = standardGlyphName(code);
+    if (name) {
+      map.set(code, name);
+    }
+  }
+  if (encoding && typeof encoding === "object" && Array.isArray(encoding.Differences)) {
+    let code = 0;
+    for (const item of encoding.Differences) {
+      if (typeof item === "number") {
+        code = item;
+      } else if (typeof item === "string") {
+        map.set(code, item);
+        code += 1;
+      }
+    }
+  }
+  return map;
+}
+
+function standardGlyphName(code) {
+  if (code >= 65 && code <= 90) return String.fromCharCode(code);
+  if (code >= 97 && code <= 122) return String.fromCharCode(code);
+  if (code >= 48 && code <= 57) return ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"][code - 48];
+  return MAC_ROMAN_GLYPH_NAMES[code] || null;
+}
+
+const MAC_ROMAN_GLYPH_NAMES = {
+  32: "space", 33: "exclam", 34: "quotedbl", 35: "numbersign", 36: "dollar", 37: "percent", 38: "ampersand", 39: "quotesingle",
+  40: "parenleft", 41: "parenright", 42: "asterisk", 43: "plus", 44: "comma", 45: "hyphen", 46: "period", 47: "slash",
+  58: "colon", 59: "semicolon", 60: "less", 61: "equal", 62: "greater", 63: "question", 64: "at", 91: "bracketleft", 92: "backslash", 93: "bracketright", 94: "asciicircum", 95: "underscore", 96: "grave", 123: "braceleft", 124: "bar", 125: "braceright", 126: "asciitilde",
+  128: "Adieresis", 129: "Aring", 130: "Ccedilla", 131: "Eacute", 132: "Ntilde", 133: "Odieresis", 134: "Udieresis", 135: "aacute", 136: "agrave", 137: "acircumflex", 138: "adieresis", 139: "atilde", 140: "aring", 141: "ccedilla", 142: "eacute", 143: "egrave", 144: "ecircumflex", 145: "edieresis", 146: "iacute", 147: "igrave", 148: "icircumflex", 149: "idieresis", 150: "ntilde", 151: "oacute", 152: "ograve", 153: "ocircumflex", 154: "odieresis", 155: "otilde", 156: "uacute", 157: "ugrave", 158: "ucircumflex", 159: "udieresis",
+  160: "dagger", 161: "degree", 162: "cent", 163: "sterling", 164: "section", 165: "bullet", 166: "paragraph", 167: "germandbls", 168: "registered", 169: "copyright", 170: "trademark", 171: "acute", 172: "dieresis", 173: "notequal", 174: "AE", 175: "Oslash", 176: "infinity", 177: "plusminus", 178: "lessequal", 179: "greaterequal", 180: "yen", 181: "mu", 182: "partialdiff", 183: "summation", 184: "product", 185: "pi", 186: "integral", 187: "ordfeminine", 188: "ordmasculine", 189: "Omega", 190: "ae", 191: "oslash",
+  192: "questiondown", 193: "exclamdown", 194: "logicalnot", 195: "radical", 196: "florin", 197: "approxequal", 198: "Delta", 199: "guillemotleft", 200: "guillemotright", 201: "ellipsis", 202: "space", 203: "Agrave", 204: "Atilde", 205: "Otilde", 206: "OE", 207: "oe", 208: "endash", 209: "emdash", 210: "quotedblleft", 211: "quotedblright", 212: "quoteleft", 213: "quoteright", 214: "divide", 215: "lozenge", 216: "ydieresis", 217: "Ydieresis", 218: "fraction", 219: "currency", 220: "guilsinglleft", 221: "guilsinglright", 222: "fi", 223: "fl",
+  224: "daggerdbl", 225: "periodcentered", 226: "quotesinglbase", 227: "quotedblbase", 228: "perthousand", 229: "Acircumflex", 230: "Ecircumflex", 231: "Aacute", 232: "Edieresis", 233: "Egrave", 234: "Iacute", 235: "Icircumflex", 236: "Idieresis", 237: "Igrave", 238: "Oacute", 239: "Ocircumflex", 240: "apple", 241: "Ograve", 242: "Uacute", 243: "Ucircumflex", 244: "Ugrave", 245: "dotlessi", 246: "circumflex", 247: "tilde", 248: "macron", 249: "breve", 250: "dotaccent", 251: "ring", 252: "cedilla", 253: "hungarumlaut", 254: "ogonek", 255: "caron",
+};
+
+const CFF_STANDARD_STRINGS = [
+  ".notdef", "space", "exclam", "quotedbl", "numbersign", "dollar", "percent", "ampersand", "quoteright", "parenleft", "parenright", "asterisk", "plus", "comma", "hyphen", "period", "slash",
+  "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "colon", "semicolon", "less", "equal", "greater", "question", "at",
+  "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+  "bracketleft", "backslash", "bracketright", "asciicircum", "underscore", "quoteleft",
+  "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+  "braceleft", "bar", "braceright", "asciitilde", "exclamdown", "cent", "sterling", "fraction", "yen", "florin", "section", "currency", "quotesingle", "quotedblleft", "guillemotleft", "guilsinglleft", "guilsinglright", "fi", "fl", "endash", "dagger", "daggerdbl", "periodcentered", "paragraph", "bullet", "quotesinglbase", "quotedblbase", "quotedblright", "guillemotright", "ellipsis", "perthousand", "questiondown", "grave", "acute", "circumflex", "tilde", "macron", "breve", "dotaccent", "dieresis", "ring", "cedilla", "hungarumlaut", "ogonek", "caron", "emdash",
+  "AE", "ordfeminine", "Lslash", "Oslash", "OE", "ordmasculine", "ae", "dotlessi", "lslash", "oslash", "oe", "germandbls", "onesuperior", "logicalnot", "mu", "trademark", "Eth", "onehalf", "plusminus", "Thorn", "onequarter", "divide", "brokenbar", "degree", "thorn", "threequarters", "twosuperior", "registered", "minus", "eth", "multiply", "threesuperior", "copyright", "Aacute", "Acircumflex", "Adieresis", "Agrave", "Aring", "Atilde", "Ccedilla", "Eacute", "Ecircumflex", "Edieresis", "Egrave", "Iacute", "Icircumflex", "Idieresis", "Igrave", "Ntilde", "Oacute", "Ocircumflex", "Odieresis", "Ograve", "Otilde", "Scaron", "Uacute", "Ucircumflex", "Udieresis", "Ugrave", "Yacute", "Ydieresis", "Zcaron", "aacute", "acircumflex", "adieresis", "agrave", "aring", "atilde", "ccedilla", "eacute", "ecircumflex", "edieresis", "egrave", "iacute", "icircumflex", "idieresis", "igrave", "ntilde", "oacute", "ocircumflex", "odieresis", "ograve", "otilde", "scaron", "uacute", "ucircumflex", "udieresis", "ugrave", "yacute", "ydieresis", "zcaron"
+];
+
+const CFF_ISO_ADOBE_CHARSET = CFF_STANDARD_STRINGS.slice(0, 229);
 
 function fontCodeByteWidths(toUnicode, isCidFont) {
   if (toUnicode?.size) {
@@ -1739,7 +1920,7 @@ function decodeGlyphRun(bytes, font) {
     return [];
   }
   if (!font) {
-    return bytes.map((byte) => ({ code: byte, text: decodeWinAnsi([byte]), width: null }));
+    return bytes.map((byte) => ({ code: byte, glyphName: standardGlyphName(byte), text: decodeWinAnsi([byte]), width: null }));
   }
   const glyphs = [];
   const codeByteWidths = font.codeByteWidths?.length ? font.codeByteWidths : font.isCidFont ? [2] : [1];
@@ -1755,6 +1936,7 @@ function decodeGlyphRun(bytes, font) {
     const code = codeFromBytes(codeBytes);
     glyphs.push({
       code,
+      glyphName: font.codeToGlyphName?.get(code) || standardGlyphName(code),
       text: font.isCidFont ? String.fromCharCode(code) : decodeWinAnsi([codeBytes[0]]),
       width: fontWidth(font, code),
     });
@@ -1781,6 +1963,7 @@ function matchMappedGlyph(bytes, index, codeByteWidths, font) {
       byteWidth,
       glyph: {
         code,
+        glyphName: font.codeToGlyphName?.get(code) || standardGlyphName(code),
         text: font.toUnicode.get(key),
         width: fontWidth(font, code),
       },
@@ -1852,6 +2035,20 @@ function colorFromColorSpace(colorSpace, operands) {
   return `rgb(${red || 0}, ${green || 0}, ${blue || 0})`;
 }
 
+function colorSpaceLabel(colorSpace) {
+  if (Array.isArray(colorSpace)) {
+    const name = colorSpace[0];
+    if (name === "ICCBased") {
+      return `ICCBased(${Number(colorSpace[1]?.N) || "unknown"})`;
+    }
+    if (name === "Indexed" || name === "I") {
+      return `Indexed(${colorSpaceLabel(colorSpace[1])})`;
+    }
+    return name || "unknown";
+  }
+  return colorSpace || "unknown";
+}
+
 function colorComponent(value) {
   return Math.round(clamp01(value) * 255);
 }
@@ -1890,12 +2087,18 @@ function fontWeightFor(font) {
 }
 
 function fontFamilyFor(font) {
+  if (font?.embeddedFontLoaded && font.embeddedFontFamily) {
+    return quoteCssFontFamily(font.embeddedFontFamily);
+  }
   const base = normalizedFontName(font);
   if (base.includes("lora")) {
     return "Lora, Georgia, Times New Roman, serif";
   }
   if (base.includes("merriweather")) {
     return "Merriweather, Georgia, Times New Roman, serif";
+  }
+  if (base.includes("satyr") || base.includes("faunus") || base.includes("crimson")) {
+    return "Georgia, Times New Roman, serif";
   }
   if (base.includes("poppins")) {
     return "Poppins, Avenir Next, Helvetica Neue, Arial, sans-serif";
@@ -1916,6 +2119,1007 @@ function fontFamilyFor(font) {
     return "Arial, Helvetica, sans-serif";
   }
   return "Arial, Helvetica, sans-serif";
+}
+
+function quoteCssFontFamily(value) {
+  return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+}
+
+function embeddedFontEntry(descriptor) {
+  if (!descriptor) {
+    return null;
+  }
+  if (descriptor.FontFile2) {
+    return { ref: descriptor.FontFile2, format: "truetype" };
+  }
+  if (descriptor.FontFile3) {
+    return { ref: descriptor.FontFile3, format: descriptor.Subtype || "fontfile3" };
+  }
+  if (descriptor.FontFile) {
+    return { ref: descriptor.FontFile, format: "type1" };
+  }
+  return null;
+}
+
+async function installEmbeddedBrowserFont(embedded, metrics, toUnicode) {
+  if (!embedded?.bytes || embedded.loaded || embedded.format !== "Type1C" || embedded.outlineFont?.kind !== "cff" || typeof document === "undefined" || !document.fonts) {
+    return;
+  }
+  try {
+    const fontBytes = buildOpenTypeCffFont(embedded.bytes, embedded.outlineFont, metrics, toUnicode, embedded.family);
+    const fontFace = new FontFace(embedded.family, fontBytes.buffer.slice(fontBytes.byteOffset, fontBytes.byteOffset + fontBytes.byteLength));
+    await fontFace.load();
+    document.fonts.add(fontFace);
+    embedded.loaded = true;
+    embedded.error = null;
+  } catch (error) {
+    embedded.error = `Could not wrap Type1C/CFF as OpenType: ${error.message}`;
+  }
+}
+
+function buildOpenTypeCffFont(cffBytes, cffFont, metrics, toUnicode, family) {
+  const glyphCount = cffFont.charStrings.length;
+  const cmap = cffUnicodeGlyphMap(cffFont, metrics, toUnicode);
+  const widths = cffGlyphWidths(cffFont, metrics);
+  const tables = new Map([
+    ["CFF ", cffBytes],
+    ["OS/2", buildOs2Table(cmap)],
+    ["cmap", buildCmapTable(cmap)],
+    ["head", buildHeadTable()],
+    ["hhea", buildHheaTable(glyphCount, widths)],
+    ["hmtx", buildHmtxTable(widths)],
+    ["maxp", buildMaxpTable(glyphCount)],
+    ["name", buildNameTable(family)],
+    ["post", buildPostTable()],
+  ]);
+  return buildSfnt("OTTO", tables);
+}
+
+function cffUnicodeGlyphMap(cffFont, metrics, toUnicode) {
+  const map = new Map();
+  for (const [code, glyphName] of metrics.codeToGlyphName || []) {
+    const glyphIndex = cffFont.nameToGlyph.get(glyphName);
+    if (!Number.isFinite(glyphIndex)) {
+      continue;
+    }
+    const unicode = unicodeForPdfCode(code, toUnicode) || unicodeForGlyphName(glyphName);
+    if (unicode && unicode >= 0 && unicode < 0xffff) {
+      map.set(unicode, glyphIndex);
+    }
+  }
+  return map;
+}
+
+function unicodeForPdfCode(code, toUnicode) {
+  if (!toUnicode?.size) {
+    return null;
+  }
+  const width = code > 0xff ? 4 : 2;
+  const text = toUnicode.get(code.toString(16).toUpperCase().padStart(width, "0"));
+  const chars = text ? Array.from(text) : [];
+  return chars.length === 1 ? chars[0].codePointAt(0) : null;
+}
+
+function unicodeForGlyphName(name) {
+  if (!name) {
+    return null;
+  }
+  if (name.length === 1) {
+    return name.codePointAt(0);
+  }
+  const digit = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"].indexOf(name);
+  return digit >= 0 ? 48 + digit : null;
+}
+
+function cffGlyphWidths(cffFont, metrics) {
+  const widths = new Array(cffFont.charStrings.length).fill(Number.isFinite(metrics.defaultWidth) ? metrics.defaultWidth : 500);
+  for (const [code, glyphName] of metrics.codeToGlyphName || []) {
+    const glyphIndex = cffFont.nameToGlyph.get(glyphName);
+    if (Number.isFinite(glyphIndex)) {
+      widths[glyphIndex] = metrics.widths.get(code) ?? widths[glyphIndex];
+    }
+  }
+  widths[0] = widths[0] || 500;
+  return widths.map((width) => Math.max(0, Math.min(0xffff, Math.round(width))));
+}
+
+function buildSfnt(version, tableMap) {
+  const entries = Array.from(tableMap.entries()).sort(([left], [right]) => left.localeCompare(right));
+  const tableCount = entries.length;
+  const entrySelector = Math.floor(Math.log2(tableCount));
+  const searchRange = 16 * (1 << entrySelector);
+  const rangeShift = tableCount * 16 - searchRange;
+  let offset = 12 + tableCount * 16;
+  const records = [];
+  const tableBytes = [];
+  for (const [tag, bytes] of entries) {
+    const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const padded = paddedTable(data);
+    records.push({ tag, checksum: tableChecksum(padded), offset, length: data.length });
+    tableBytes.push(padded);
+    offset += padded.length;
+  }
+  const output = new Uint8Array(offset);
+  const writer = new BinaryWriter(output);
+  writer.tag(version);
+  writer.uint16(tableCount);
+  writer.uint16(searchRange);
+  writer.uint16(entrySelector);
+  writer.uint16(rangeShift);
+  for (const record of records) {
+    writer.tag(record.tag);
+    writer.uint32(record.checksum);
+    writer.uint32(record.offset);
+    writer.uint32(record.length);
+  }
+  for (const table of tableBytes) {
+    output.set(table, writer.offset);
+    writer.offset += table.length;
+  }
+  const headRecord = records.find((record) => record.tag === "head");
+  writeUint32(output, headRecord.offset + 8, (0xb1b0afba - tableChecksum(output)) >>> 0);
+  return output;
+}
+
+function paddedTable(bytes) {
+  const padded = new Uint8Array(Math.ceil(bytes.length / 4) * 4);
+  padded.set(bytes);
+  return padded;
+}
+
+function tableChecksum(bytes) {
+  let sum = 0;
+  for (let offset = 0; offset < bytes.length; offset += 4) {
+    sum = (sum + readUint32(bytes, offset)) >>> 0;
+  }
+  return sum;
+}
+
+function buildCmapTable(map) {
+  const codes = Array.from(map.keys()).sort((left, right) => left - right);
+  const segCount = codes.length + 1;
+  const entrySelector = Math.floor(Math.log2(segCount));
+  const searchRange = 2 * (1 << entrySelector);
+  const rangeShift = segCount * 2 - searchRange;
+  const length = 16 + segCount * 8;
+  const bytes = new Uint8Array(12 + length);
+  const writer = new BinaryWriter(bytes);
+  writer.uint16(0);
+  writer.uint16(1);
+  writer.uint16(3);
+  writer.uint16(1);
+  writer.uint32(12);
+  writer.uint16(4);
+  writer.uint16(length);
+  writer.uint16(0);
+  writer.uint16(segCount * 2);
+  writer.uint16(searchRange);
+  writer.uint16(entrySelector);
+  writer.uint16(rangeShift);
+  for (const code of codes) writer.uint16(code);
+  writer.uint16(0xffff);
+  writer.uint16(0);
+  for (const code of codes) writer.uint16(code);
+  writer.uint16(0xffff);
+  for (const code of codes) writer.int16(((map.get(code) - code) & 0xffff) << 16 >> 16);
+  writer.int16(1);
+  for (let index = 0; index < segCount; index += 1) writer.uint16(0);
+  return bytes;
+}
+
+function buildHeadTable() {
+  const writer = new BinaryWriter(new Uint8Array(54));
+  writer.fixed(1);
+  writer.fixed(1);
+  writer.uint32(0);
+  writer.uint32(0x5f0f3cf5);
+  writer.uint16(0);
+  writer.uint16(1000);
+  writer.longDateTime(0);
+  writer.longDateTime(0);
+  writer.int16(-1000);
+  writer.int16(-500);
+  writer.int16(2000);
+  writer.int16(1200);
+  writer.uint16(0);
+  writer.uint16(8);
+  writer.int16(2);
+  writer.int16(0);
+  writer.int16(0);
+  return writer.bytes;
+}
+
+function buildHheaTable(glyphCount, widths) {
+  const writer = new BinaryWriter(new Uint8Array(36));
+  writer.fixed(1);
+  writer.int16(800);
+  writer.int16(-250);
+  writer.int16(200);
+  writer.uint16(Math.max(...widths, 500));
+  writer.int16(0);
+  writer.int16(0);
+  writer.int16(Math.max(...widths, 500));
+  writer.int16(1);
+  writer.int16(0);
+  writer.int16(0);
+  for (let index = 0; index < 4; index += 1) writer.int16(0);
+  writer.int16(0);
+  writer.uint16(glyphCount);
+  return writer.bytes;
+}
+
+function buildHmtxTable(widths) {
+  const writer = new BinaryWriter(new Uint8Array(widths.length * 4));
+  for (const width of widths) {
+    writer.uint16(width);
+    writer.int16(0);
+  }
+  return writer.bytes;
+}
+
+function buildMaxpTable(glyphCount) {
+  const writer = new BinaryWriter(new Uint8Array(6));
+  writer.uint32(0x00005000);
+  writer.uint16(glyphCount);
+  return writer.bytes;
+}
+
+function buildNameTable(family) {
+  const records = [1, 2, 4, 6].map((id) => ({ id, text: id === 2 ? "Regular" : family.replace(/[^A-Za-z0-9-]/g, "") }));
+  const strings = records.map((record) => utf16Be(record.text));
+  const stringOffset = 6 + records.length * 12;
+  const length = stringOffset + strings.reduce((sum, bytes) => sum + bytes.length, 0);
+  const writer = new BinaryWriter(new Uint8Array(length));
+  writer.uint16(0);
+  writer.uint16(records.length);
+  writer.uint16(stringOffset);
+  let offset = 0;
+  records.forEach((record, index) => {
+    writer.uint16(3);
+    writer.uint16(1);
+    writer.uint16(0x0409);
+    writer.uint16(record.id);
+    writer.uint16(strings[index].length);
+    writer.uint16(offset);
+    offset += strings[index].length;
+  });
+  for (const bytes of strings) {
+    writer.bytes.set(bytes, writer.offset);
+    writer.offset += bytes.length;
+  }
+  return writer.bytes;
+}
+
+function utf16Be(text) {
+  const bytes = new Uint8Array(text.length * 2);
+  for (let index = 0; index < text.length; index += 1) {
+    writeUint16(bytes, index * 2, text.charCodeAt(index));
+  }
+  return bytes;
+}
+
+function buildOs2Table(map) {
+  const codes = Array.from(map.keys());
+  const first = codes.length ? Math.min(...codes) : 0;
+  const last = codes.length ? Math.max(...codes) : 0;
+  const writer = new BinaryWriter(new Uint8Array(96));
+  writer.uint16(3);
+  writer.int16(500);
+  writer.uint16(400);
+  writer.uint16(5);
+  writer.uint16(0);
+  for (let index = 0; index < 11; index += 1) writer.int16(0);
+  writer.bytes.set(new Uint8Array(10), writer.offset); writer.offset += 10;
+  writer.uint32(1);
+  writer.uint32(0);
+  writer.uint32(0);
+  writer.uint32(0);
+  writer.tag("PDFL");
+  writer.uint16(0x0040);
+  writer.uint16(first);
+  writer.uint16(last);
+  writer.int16(800);
+  writer.int16(-250);
+  writer.int16(200);
+  writer.uint16(1000);
+  writer.uint16(300);
+  writer.uint32(0);
+  writer.uint32(0);
+  writer.int16(500);
+  writer.int16(700);
+  writer.uint16(0);
+  writer.uint16(32);
+  writer.uint16(1);
+  return writer.bytes;
+}
+
+function buildPostTable() {
+  const writer = new BinaryWriter(new Uint8Array(32));
+  writer.fixed(3);
+  writer.fixed(0);
+  writer.int16(-100);
+  writer.int16(50);
+  writer.uint32(0);
+  writer.uint32(0);
+  writer.uint32(0);
+  writer.uint32(0);
+  writer.uint32(0);
+  return writer.bytes;
+}
+
+function parseCffFont(bytes) {
+  const headerSize = bytes[2] || 4;
+  let offset = headerSize;
+  const nameIndex = readCffIndex(bytes, offset); offset = nameIndex.end;
+  const topIndex = readCffIndex(bytes, offset); offset = topIndex.end;
+  const stringIndex = readCffIndex(bytes, offset); offset = stringIndex.end;
+  const globalSubrIndex = readCffIndex(bytes, offset);
+  const topDict = parseCffDict(topIndex.objects[0] || new Uint8Array());
+  const charStringsOffset = topDict.CharStrings;
+  if (!charStringsOffset) {
+    return null;
+  }
+  const charStrings = readCffIndex(bytes, charStringsOffset).objects;
+  const strings = stringIndex.objects.map((value) => bytesToBinaryString(value));
+  const charset = readCffCharset(bytes, topDict.charset || 0, charStrings.length, strings);
+  let localSubrs = [];
+  if (Array.isArray(topDict.Private)) {
+    const privateOffset = topDict.Private[1];
+    const privateSize = topDict.Private[0];
+    const privateDict = parseCffDict(bytes.slice(privateOffset, privateOffset + privateSize));
+    if (privateDict.Subrs) {
+      localSubrs = readCffIndex(bytes, privateOffset + privateDict.Subrs).objects;
+    }
+  }
+  return {
+    kind: "cff",
+    unitsPerEm: 1000,
+    fontMatrix: cffFontMatrix(topDict.FontMatrix),
+    charStrings,
+    charset,
+    nameToGlyph: new Map(charset.map((name, index) => [name, index])),
+    localSubrs,
+    localSubrBias: cffSubrBias(localSubrs.length),
+    globalSubrs: globalSubrIndex.objects,
+    globalSubrBias: cffSubrBias(globalSubrIndex.objects.length),
+    glyphCache: new Map(),
+    browserInstallable: false,
+    browserInstallableError: "Type1C/CFF outlines are rendered directly, not installed as browser fonts",
+  };
+}
+
+function cffFontMatrix(value) {
+  if (!Array.isArray(value) || value.length < 6 || !value.every(Number.isFinite)) {
+    return [0.001, 0, 0, 0.001, 0, 0];
+  }
+  return value.slice(0, 6);
+}
+
+function readCffIndex(bytes, offset) {
+  const count = readUint16(bytes, offset);
+  offset += 2;
+  if (!count) {
+    return { objects: [], end: offset };
+  }
+  const offSize = bytes[offset++];
+  const offsets = [];
+  for (let index = 0; index <= count; index += 1) {
+    let value = 0;
+    for (let byteIndex = 0; byteIndex < offSize; byteIndex += 1) {
+      value = (value << 8) | bytes[offset++];
+    }
+    offsets.push(value);
+  }
+  const dataStart = offset;
+  const objects = [];
+  for (let index = 0; index < count; index += 1) {
+    objects.push(bytes.slice(dataStart + offsets[index] - 1, dataStart + offsets[index + 1] - 1));
+  }
+  return { objects, end: dataStart + offsets[count] - 1 };
+}
+
+function parseCffDict(bytes) {
+  const dict = {};
+  const stack = [];
+  for (let index = 0; index < bytes.length;) {
+    const byte = bytes[index++];
+    if (byte <= 21) {
+      const operator = byte === 12 ? `12 ${bytes[index++]}` : String(byte);
+      assignCffDictOperator(dict, operator, stack.splice(0));
+      continue;
+    }
+    const parsed = readCffNumber(bytes, index - 1);
+    stack.push(parsed.value);
+    index = parsed.offset;
+  }
+  return dict;
+}
+
+function assignCffDictOperator(dict, operator, operands) {
+  const value = operands.length === 1 ? operands[0] : operands;
+  if (operator === "12 7") dict.FontMatrix = operands;
+  if (operator === "15") dict.charset = value;
+  if (operator === "17") dict.CharStrings = value;
+  if (operator === "18") dict.Private = operands;
+  if (operator === "19") dict.Subrs = value;
+}
+
+function readCffNumber(bytes, offset) {
+  const byte = bytes[offset++];
+  if (byte >= 32 && byte <= 246) return { value: byte - 139, offset };
+  if (byte >= 247 && byte <= 250) return { value: (byte - 247) * 256 + bytes[offset++] + 108, offset };
+  if (byte >= 251 && byte <= 254) return { value: -(byte - 251) * 256 - bytes[offset++] - 108, offset };
+  if (byte === 28) {
+    const value = readInt16(bytes, offset);
+    return { value, offset: offset + 2 };
+  }
+  if (byte === 29) {
+    const value = readUint32(bytes, offset);
+    return { value, offset: offset + 4 };
+  }
+  if (byte === 30) return readCffRealNumber(bytes, offset);
+  return { value: 0, offset };
+}
+
+function readCffRealNumber(bytes, offset) {
+  let value = "";
+  while (offset < bytes.length) {
+    const byte = bytes[offset++];
+    for (const nibble of [byte >> 4, byte & 0x0f]) {
+      if (nibble === 0x0f) {
+        const number = Number(value);
+        return { value: Number.isFinite(number) ? number : 0, offset };
+      }
+      value += cffRealNibble(nibble);
+    }
+  }
+  const number = Number(value);
+  return { value: Number.isFinite(number) ? number : 0, offset };
+}
+
+function cffRealNibble(nibble) {
+  if (nibble <= 9) return String(nibble);
+  if (nibble === 0x0a) return ".";
+  if (nibble === 0x0b) return "E";
+  if (nibble === 0x0c) return "E-";
+  if (nibble === 0x0e) return "-";
+  return "";
+}
+
+function readCffCharset(bytes, offset, glyphCount, strings) {
+  if (offset === 0) {
+    return CFF_ISO_ADOBE_CHARSET.slice(0, glyphCount);
+  }
+  const names = [".notdef"];
+  const format = bytes[offset++];
+  if (format === 0) {
+    while (names.length < glyphCount) {
+      names.push(cffString(readUint16(bytes, offset), strings));
+      offset += 2;
+    }
+  } else if (format === 1 || format === 2) {
+    while (names.length < glyphCount) {
+      let sid = readUint16(bytes, offset); offset += 2;
+      const left = format === 1 ? bytes[offset++] : readUint16(bytes, offset);
+      if (format === 2) offset += 2;
+      for (let index = 0; index <= left && names.length < glyphCount; index += 1) {
+        names.push(cffString(sid + index, strings));
+      }
+    }
+  }
+  return names;
+}
+
+function cffString(sid, strings) {
+  return CFF_STANDARD_STRINGS[sid] || strings[sid - 391] || `.sid${sid}`;
+}
+
+function cffSubrBias(count) {
+  return count < 1240 ? 107 : count < 33900 ? 1131 : 32768;
+}
+
+function cffGlyphOutlineForName(font, glyphName) {
+  const glyphIndex = font.nameToGlyph.get(glyphName);
+  if (!Number.isFinite(glyphIndex)) {
+    return null;
+  }
+  if (!font.glyphCache.has(glyphIndex)) {
+    font.glyphCache.set(glyphIndex, parseType2CharString(font, glyphIndex));
+  }
+  return font.glyphCache.get(glyphIndex);
+}
+
+function parseType2CharString(font, glyphIndex) {
+  const commands = [];
+  const state = { x: 0, y: 0, stack: [], stems: 0, commands };
+  interpretType2Bytes(font, font.charStrings[glyphIndex], state, 0);
+  return commands.length ? { commands } : null;
+}
+
+function interpretType2Bytes(font, bytes, state, depth) {
+  if (!bytes || depth > 10) return;
+  for (let offset = 0; offset < bytes.length;) {
+    const byte = bytes[offset++];
+    if (byte >= 32 || byte === 28 || byte === 255) {
+      const parsed = readType2Number(bytes, offset - 1);
+      state.stack.push(parsed.value);
+      offset = parsed.offset;
+      continue;
+    }
+    if (byte === 12) {
+      interpretType2Escape(bytes[offset++], state);
+      continue;
+    }
+    if (byte === 10 || byte === 29) {
+      const operand = state.stack.pop();
+      const subrs = byte === 10 ? font.localSubrs : font.globalSubrs;
+      const bias = byte === 10 ? font.localSubrBias : font.globalSubrBias;
+      interpretType2Bytes(font, subrs[operand + bias], state, depth + 1);
+      continue;
+    }
+    if (byte === 11) return;
+    offset = interpretType2Operator(byte, bytes, offset, state);
+  }
+}
+
+function readType2Number(bytes, offset) {
+  const byte = bytes[offset++];
+  if (byte >= 32 && byte <= 246) return { value: byte - 139, offset };
+  if (byte >= 247 && byte <= 250) return { value: (byte - 247) * 256 + bytes[offset++] + 108, offset };
+  if (byte >= 251 && byte <= 254) return { value: -(byte - 251) * 256 - bytes[offset++] - 108, offset };
+  if (byte === 28) return { value: readInt16(bytes, offset), offset: offset + 2 };
+  if (byte === 255) return { value: readInt16(bytes, offset) + readUint16(bytes, offset + 2) / 65536, offset: offset + 4 };
+  return { value: 0, offset };
+}
+
+function interpretType2Operator(operator, bytes, offset, state) {
+  const stack = state.stack;
+  if ([1, 3, 18, 23].includes(operator)) {
+    state.stems += type2StemCount(stack);
+    stack.length = 0;
+    return offset;
+  }
+  if (operator === 19 || operator === 20) {
+    state.stems += type2StemCount(stack);
+    stack.length = 0;
+    return offset + Math.ceil(state.stems / 8);
+  }
+  if (operator === 13) state.x += stack[0] || 0;
+  if (operator === 4) moveType2(state, 0, stack.pop() || 0);
+  else if (operator === 21) moveType2(state, stack.at(-2) || 0, stack.at(-1) || 0);
+  else if (operator === 22) moveType2(state, stack.pop() || 0, 0);
+  else if (operator === 5) type2LinePairs(state, stack);
+  else if (operator === 6) type2AlternatingLines(state, stack, true);
+  else if (operator === 7) type2AlternatingLines(state, stack, false);
+  else if (operator === 8) type2CurveGroups(state, stack);
+  else if (operator === 14) return bytes.length;
+  else if (operator === 24) type2CurveLine(state, stack);
+  else if (operator === 25) type2LineCurve(state, stack);
+  else if (operator === 26) type2VVCurve(state, stack);
+  else if (operator === 27) type2HHCurve(state, stack);
+  else if (operator === 30) type2VHCurve(state, stack, false);
+  else if (operator === 31) type2VHCurve(state, stack, true);
+  stack.length = 0;
+  return offset;
+}
+
+function type2StemCount(stack) {
+  return Math.floor((stack.length % 2 ? stack.length - 1 : stack.length) / 2);
+}
+
+function interpretType2Escape(operator, state) {
+  const values = state.stack;
+  if (operator === 34 && values.length >= 7) {
+    const [dx1, dx2, dy2, dx3, dx4, dx5, dx6] = values;
+    curveType2(state, dx1, 0, dx2, dy2, dx3, 0);
+    curveType2(state, dx4, 0, dx5, -dy2, dx6, 0);
+  } else if (operator === 35 && values.length >= 13) {
+    curveType2(state, values[0], values[1], values[2], values[3], values[4], values[5]);
+    curveType2(state, values[6], values[7], values[8], values[9], values[10], values[11]);
+  } else if (operator === 36 && values.length >= 9) {
+    curveType2(state, values[0], values[1], values[2], values[3], values[4], 0);
+    curveType2(state, values[5], 0, values[6], values[7], values[8], -(values[1] + values[3] + values[7]));
+  } else if (operator === 37 && values.length >= 11) {
+    const dx = values[0] + values[2] + values[4] + values[6] + values[8];
+    const dy = values[1] + values[3] + values[5] + values[7] + values[9];
+    const horizontalLast = Math.abs(dx) > Math.abs(dy);
+    curveType2(state, values[0], values[1], values[2], values[3], values[4], values[5]);
+    curveType2(state, values[6], values[7], values[8], values[9], horizontalLast ? values[10] : -dx, horizontalLast ? -dy : values[10]);
+  }
+  state.stack.length = 0;
+}
+
+function moveType2(state, dx, dy) {
+  state.x += dx;
+  state.y += dy;
+  state.commands.push(["M", state.x, state.y]);
+}
+
+function lineType2(state, dx, dy) {
+  state.x += dx;
+  state.y += dy;
+  state.commands.push(["L", state.x, state.y]);
+}
+
+function curveType2(state, dx1, dy1, dx2, dy2, dx3, dy3) {
+  const x1 = state.x + dx1;
+  const y1 = state.y + dy1;
+  const x2 = x1 + dx2;
+  const y2 = y1 + dy2;
+  state.x = x2 + dx3;
+  state.y = y2 + dy3;
+  state.commands.push(["C", x1, y1, x2, y2, state.x, state.y]);
+}
+
+function type2LinePairs(state, values) {
+  for (let index = 0; index + 1 < values.length; index += 2) lineType2(state, values[index], values[index + 1]);
+}
+
+function type2AlternatingLines(state, values, horizontalFirst) {
+  values.forEach((value, index) => lineType2(state, (index % 2 === 0) === horizontalFirst ? value : 0, (index % 2 === 0) === horizontalFirst ? 0 : value));
+}
+
+function type2CurveGroups(state, values) {
+  for (let index = 0; index + 5 < values.length; index += 6) curveType2(state, values[index], values[index + 1], values[index + 2], values[index + 3], values[index + 4], values[index + 5]);
+}
+
+function type2CurveLine(state, values) {
+  type2CurveGroups(state, values.slice(0, -2));
+  lineType2(state, values.at(-2) || 0, values.at(-1) || 0);
+}
+
+function type2LineCurve(state, values) {
+  type2LinePairs(state, values.slice(0, -6));
+  type2CurveGroups(state, values.slice(-6));
+}
+
+function type2VVCurve(state, values) {
+  let index = values.length % 2 ? 1 : 0;
+  if (index) curveType2(state, values[0], values[1], values[2], values[3], 0, values[4]);
+  for (; index + 3 < values.length; index += 4) curveType2(state, 0, values[index], values[index + 1], values[index + 2], 0, values[index + 3]);
+}
+
+function type2HHCurve(state, values) {
+  let index = values.length % 2 ? 1 : 0;
+  if (index) curveType2(state, values[1], values[0], values[2], values[3], values[4], 0);
+  for (; index + 3 < values.length; index += 4) curveType2(state, values[index], 0, values[index + 1], values[index + 2], values[index + 3], 0);
+}
+
+function type2VHCurve(state, values, horizontalFirst) {
+  let index = 0;
+  while (index + 3 < values.length) {
+    const remainingAfterCurve = values.length - index - 4;
+    const finalDelta = remainingAfterCurve === 1 ? values[index + 4] : 0;
+    if (horizontalFirst) {
+      curveType2(state, values[index], 0, values[index + 1], values[index + 2], finalDelta, values[index + 3]);
+    } else {
+      curveType2(state, 0, values[index], values[index + 1], values[index + 2], values[index + 3], finalDelta);
+    }
+    index += finalDelta ? 5 : 4;
+    horizontalFirst = !horizontalFirst;
+  }
+}
+
+function parseTrueTypeFont(bytes) {
+  const tables = trueTypeTables(bytes);
+  const head = tables.get("head");
+  const maxp = tables.get("maxp");
+  const loca = tables.get("loca");
+  const glyf = tables.get("glyf");
+  const cmap = tables.get("cmap");
+  if (!head || !maxp || !loca || !glyf || !cmap) {
+    return null;
+  }
+  const unitsPerEm = readUint16(bytes, head.offset + 18) || 1000;
+  const indexToLocFormat = readInt16(bytes, head.offset + 50);
+  const glyphCount = readUint16(bytes, maxp.offset + 4);
+  return {
+    bytes,
+    tables,
+    unitsPerEm,
+    indexToLocFormat,
+    glyphCount,
+    cmap: parseTrueTypeCmap(bytes, cmap),
+    glyphCache: new Map(),
+    browserInstallable: tables.has("OS/2"),
+    browserInstallableError: tables.has("OS/2") ? null : "TrueType subset is missing browser-required OS/2 table",
+  };
+}
+
+function trueTypeTables(bytes) {
+  const tables = new Map();
+  const tableCount = readUint16(bytes, 4);
+  for (let tableIndex = 0; tableIndex < tableCount; tableIndex += 1) {
+    const offset = 12 + tableIndex * 16;
+    tables.set(readTag(bytes, offset), {
+      offset: readUint32(bytes, offset + 8),
+      length: readUint32(bytes, offset + 12),
+    });
+  }
+  return tables;
+}
+
+function parseTrueTypeCmap(bytes, table) {
+  const maps = [];
+  const subtableCount = readUint16(bytes, table.offset + 2);
+  for (let recordIndex = 0; recordIndex < subtableCount; recordIndex += 1) {
+    const recordOffset = table.offset + 4 + recordIndex * 8;
+    const platform = readUint16(bytes, recordOffset);
+    const encoding = readUint16(bytes, recordOffset + 2);
+    const subtableOffset = table.offset + readUint32(bytes, recordOffset + 4);
+    const format = readUint16(bytes, subtableOffset);
+    const map = format === 0 ? parseCmapFormat0(bytes, subtableOffset) : format === 4 ? parseCmapFormat4(bytes, subtableOffset) : null;
+    if (map) {
+      maps.push({ platform, encoding, map });
+    }
+  }
+  return maps.find((entry) => entry.platform === 1)?.map || maps[0]?.map || new Map();
+}
+
+function parseCmapFormat0(bytes, offset) {
+  const map = new Map();
+  for (let code = 0; code < 256; code += 1) {
+    map.set(code, bytes[offset + 6 + code] || 0);
+  }
+  return map;
+}
+
+function parseCmapFormat4(bytes, offset) {
+  const map = new Map();
+  const segmentCount = readUint16(bytes, offset + 6) / 2;
+  const endCodesOffset = offset + 14;
+  const startCodesOffset = endCodesOffset + segmentCount * 2 + 2;
+  const idDeltasOffset = startCodesOffset + segmentCount * 2;
+  const idRangeOffsetsOffset = idDeltasOffset + segmentCount * 2;
+  for (let segmentIndex = 0; segmentIndex < segmentCount; segmentIndex += 1) {
+    const endCode = readUint16(bytes, endCodesOffset + segmentIndex * 2);
+    const startCode = readUint16(bytes, startCodesOffset + segmentIndex * 2);
+    const idDelta = readInt16(bytes, idDeltasOffset + segmentIndex * 2);
+    const idRangeOffsetLocation = idRangeOffsetsOffset + segmentIndex * 2;
+    const idRangeOffset = readUint16(bytes, idRangeOffsetLocation);
+    for (let code = startCode; code <= endCode && code !== 0xffff; code += 1) {
+      let glyphIndex = 0;
+      if (idRangeOffset === 0) {
+        glyphIndex = (code + idDelta) & 0xffff;
+      } else {
+        const glyphOffset = idRangeOffsetLocation + idRangeOffset + (code - startCode) * 2;
+        glyphIndex = readUint16(bytes, glyphOffset);
+        if (glyphIndex) {
+          glyphIndex = (glyphIndex + idDelta) & 0xffff;
+        }
+      }
+      map.set(code, glyphIndex);
+    }
+  }
+  return map;
+}
+
+function glyphOutlineForCode(font, code) {
+  const glyphIndex = font.cmap.get(code);
+  if (!Number.isFinite(glyphIndex)) {
+    return null;
+  }
+  if (!font.glyphCache.has(glyphIndex)) {
+    font.glyphCache.set(glyphIndex, parseGlyphOutline(font, glyphIndex));
+  }
+  return font.glyphCache.get(glyphIndex);
+}
+
+function glyphOutlineForGlyph(font, glyph) {
+  if (font.kind === "cff") {
+    return glyph.glyphName ? cffGlyphOutlineForName(font, glyph.glyphName) : null;
+  }
+  return glyphOutlineForCode(font, glyph.code);
+}
+
+function parseGlyphOutline(font, glyphIndex) {
+  const location = glyphLocation(font, glyphIndex);
+  if (!location || location.start === location.end) {
+    return null;
+  }
+  const bytes = font.bytes;
+  const glyphOffset = font.tables.get("glyf").offset + location.start;
+  const contourCount = readInt16(bytes, glyphOffset);
+  if (contourCount <= 0) {
+    return null;
+  }
+  const contourEnds = [];
+  for (let contourIndex = 0; contourIndex < contourCount; contourIndex += 1) {
+    contourEnds.push(readUint16(bytes, glyphOffset + 10 + contourIndex * 2));
+  }
+  const pointCount = contourEnds.at(-1) + 1;
+  let offset = glyphOffset + 10 + contourCount * 2;
+  offset += 2 + readUint16(bytes, offset);
+  const flags = [];
+  while (flags.length < pointCount) {
+    const flag = bytes[offset++];
+    flags.push(flag);
+    if (flag & 8) {
+      const repeat = bytes[offset++];
+      for (let repeatIndex = 0; repeatIndex < repeat; repeatIndex += 1) {
+        flags.push(flag);
+      }
+    }
+  }
+  const xs = readGlyphCoordinates(bytes, flags, offset, 2, 16);
+  offset = xs.offset;
+  const ys = readGlyphCoordinates(bytes, flags, offset, 4, 32);
+  const points = flags.map((flag, pointIndex) => ({ x: xs.values[pointIndex], y: ys.values[pointIndex], on: Boolean(flag & 1) }));
+  const contours = [];
+  let contourStart = 0;
+  for (const contourEnd of contourEnds) {
+    contours.push(points.slice(contourStart, contourEnd + 1));
+    contourStart = contourEnd + 1;
+  }
+  return contours;
+}
+
+function readGlyphCoordinates(bytes, flags, offset, shortFlag, sameFlag) {
+  const values = [];
+  let value = 0;
+  for (const flag of flags) {
+    let delta = 0;
+    if (flag & shortFlag) {
+      delta = bytes[offset++];
+      if (!(flag & sameFlag)) {
+        delta = -delta;
+      }
+    } else if (!(flag & sameFlag)) {
+      delta = readInt16(bytes, offset);
+      offset += 2;
+    }
+    value += delta;
+    values.push(value);
+  }
+  return { values, offset };
+}
+
+function glyphLocation(font, glyphIndex) {
+  if (glyphIndex < 0 || glyphIndex >= font.glyphCount) {
+    return null;
+  }
+  const locaOffset = font.tables.get("loca").offset;
+  if (font.indexToLocFormat === 0) {
+    return {
+      start: readUint16(font.bytes, locaOffset + glyphIndex * 2) * 2,
+      end: readUint16(font.bytes, locaOffset + glyphIndex * 2 + 2) * 2,
+    };
+  }
+  return {
+    start: readUint32(font.bytes, locaOffset + glyphIndex * 4),
+    end: readUint32(font.bytes, locaOffset + glyphIndex * 4 + 4),
+  };
+}
+
+function appendGlyphPath(context, contours, x, scale, fontSize = 1, outlineFont = null) {
+  if (contours?.commands) {
+    appendCommandGlyphPath(context, contours.commands, x, scale, fontSize, outlineFont?.fontMatrix);
+    return;
+  }
+  for (const contour of contours) {
+    appendGlyphContour(context, contour, x, scale);
+  }
+}
+
+function appendCommandGlyphPath(context, commands, x, scale, fontSize, fontMatrix) {
+  for (const command of commands) {
+    if (command[0] === "M") {
+      const [pointX, pointY] = glyphCommandPoint(command[1], command[2], x, scale, fontSize, fontMatrix);
+      context.moveTo(pointX, pointY);
+    }
+    if (command[0] === "L") {
+      const [pointX, pointY] = glyphCommandPoint(command[1], command[2], x, scale, fontSize, fontMatrix);
+      context.lineTo(pointX, pointY);
+    }
+    if (command[0] === "C") {
+      const first = glyphCommandPoint(command[1], command[2], x, scale, fontSize, fontMatrix);
+      const second = glyphCommandPoint(command[3], command[4], x, scale, fontSize, fontMatrix);
+      const third = glyphCommandPoint(command[5], command[6], x, scale, fontSize, fontMatrix);
+      context.bezierCurveTo(first[0], first[1], second[0], second[1], third[0], third[1]);
+    }
+  }
+}
+
+function glyphCommandPoint(glyphX, glyphY, x, scale, fontSize, fontMatrix) {
+  if (!fontMatrix) {
+    return [x + glyphX * scale, -glyphY * scale];
+  }
+  const [a, b, c, d, e, f] = fontMatrix;
+  return [x + (glyphX * a + glyphY * c + e) * fontSize, -(glyphX * b + glyphY * d + f) * fontSize];
+}
+
+function appendGlyphContour(context, contour, x, scale) {
+  if (!contour.length) {
+    return;
+  }
+  const first = contour[0];
+  const last = contour.at(-1);
+  const start = first.on ? first : last.on ? last : midpoint(first, last);
+  context.moveTo(x + start.x * scale, -start.y * scale);
+  let pointIndex = first.on ? 1 : 0;
+  while (pointIndex < contour.length) {
+    const point = contour[pointIndex];
+    if (point.on) {
+      context.lineTo(x + point.x * scale, -point.y * scale);
+      pointIndex += 1;
+      continue;
+    }
+    const next = contour[(pointIndex + 1) % contour.length];
+    const end = next.on ? next : midpoint(point, next);
+    context.quadraticCurveTo(x + point.x * scale, -point.y * scale, x + end.x * scale, -end.y * scale);
+    pointIndex += next.on ? 2 : 1;
+  }
+  context.closePath();
+}
+
+function midpoint(first, second) {
+  return { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2, on: true };
+}
+
+function readTag(bytes, offset) {
+  return String.fromCharCode(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]);
+}
+
+class BinaryWriter {
+  constructor(bytes) {
+    this.bytes = bytes;
+    this.offset = 0;
+  }
+
+  tag(value) {
+    for (let index = 0; index < 4; index += 1) {
+      this.bytes[this.offset++] = value.charCodeAt(index) || 0;
+    }
+  }
+
+  uint16(value) {
+    writeUint16(this.bytes, this.offset, value);
+    this.offset += 2;
+  }
+
+  int16(value) {
+    writeUint16(this.bytes, this.offset, value & 0xffff);
+    this.offset += 2;
+  }
+
+  uint32(value) {
+    writeUint32(this.bytes, this.offset, value);
+    this.offset += 4;
+  }
+
+  fixed(value) {
+    this.uint32(Math.round(value * 65536) >>> 0);
+  }
+
+  longDateTime(value) {
+    this.uint32(0);
+    this.uint32(value >>> 0);
+  }
+}
+
+function writeUint16(bytes, offset, value) {
+  bytes[offset] = (value >>> 8) & 0xff;
+  bytes[offset + 1] = value & 0xff;
+}
+
+function writeUint32(bytes, offset, value) {
+  bytes[offset] = (value >>> 24) & 0xff;
+  bytes[offset + 1] = (value >>> 16) & 0xff;
+  bytes[offset + 2] = (value >>> 8) & 0xff;
+  bytes[offset + 3] = value & 0xff;
+}
+
+function readUint16(bytes, offset) {
+  return ((bytes[offset] || 0) << 8) | (bytes[offset + 1] || 0);
+}
+
+function readInt16(bytes, offset) {
+  const value = readUint16(bytes, offset);
+  return value & 0x8000 ? value - 0x10000 : value;
+}
+
+function readUint32(bytes, offset) {
+  return (((bytes[offset] || 0) * 0x1000000) + (((bytes[offset + 1] || 0) << 16) | ((bytes[offset + 2] || 0) << 8) | (bytes[offset + 3] || 0))) >>> 0;
 }
 
 function normalizedFontName(font) {

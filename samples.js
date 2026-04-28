@@ -111,5 +111,29 @@ const BT_DRUCKSACHEN = [
     type: "sample",
     title: "fundamentacao",
     pdfPath: "fundamentacao.pdf"
+  },
+  {
+    id: "test-pdf-4",
+    type: "sample",
+    title: "Test PDF 4",
+    pdfPath: "Test-pdf_4.pdf"
+  },
+  {
+    id: "dictionary",
+    type: "sample",
+    title: "dictionary",
+    pdfPath: "dictionary.pdf"
+  },
+  {
+    id: "hardback",
+    type: "sample",
+    title: "hardback",
+    pdfPath: "hardback.pdf"
+  },
+  {
+    id: "index",
+    type: "sample",
+    title: "index",
+    pdfPath: "index.pdf"
   }
 ];

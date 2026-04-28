@@ -33,6 +33,13 @@
             <option value="diff">Difference</option>
           </select>
         </label>
+        <label>
+          <span>Fonts</span>
+          <select id="font-mode-select">
+            <option value="stable">Stable</option>
+            <option value="embedded">Embedded outlines</option>
+          </select>
+        </label>
         <button id="render-button" type="button">Render</button>
       </div>
     </header>
@@ -66,6 +73,6 @@
       </section>
     </main>
 
-    <script type="module" src="./src/reader-app.js?v=font-fallbacks"></script>
+    <script type="module" src="./src/reader-app.js?v=font-modes"></script>
   </body>
 </html>

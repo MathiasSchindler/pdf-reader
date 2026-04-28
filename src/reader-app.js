@@ -7,6 +7,7 @@ const documentSelect = document.getElementById("document-select");
 const scaleInput = document.getElementById("scale-input");
 const pageRangeInput = document.getElementById("page-range-input");
 const viewModeSelect = document.getElementById("view-mode-select");
+const fontModeSelect = document.getElementById("font-mode-select");
 const renderButton = document.getElementById("render-button");
 const statusView = document.getElementById("status");
 const documentOutput = document.getElementById("document-output");
@@ -44,6 +45,7 @@ async function init() {
       }
     });
     viewModeSelect.addEventListener("change", renderSelectedDocument);
+    fontModeSelect.addEventListener("change", renderSelectedDocument);
     window.addEventListener("hashchange", renderDocumentFromHash);
     await renderSelectedDocument();
   } catch (error) {
@@ -153,6 +155,7 @@ async function renderSelectedDocument() {
   const token = ++renderToken;
   const scale = Number(scaleInput.value) || 1;
   const viewMode = viewModeSelect.value || "lite";
+  const fontMode = fontModeSelect.value || "stable";
   setStatus(`Loading ${selectedDocument.number || selectedDocument.id}`);
   pageStack.innerHTML = "";
   auditOutput.textContent = "";
@@ -173,7 +176,7 @@ async function renderSelectedDocument() {
       await pdfjsDocument?.destroy();
       return;
     }
-    setStatus(`Parsed ${documentLabel(selectedDocument)}: ${summary.pages} pages, ${summary.objects} objects. Rendering ${pageSelection} in ${viewModeLabel(viewMode)} mode.`);
+    setStatus(`Parsed ${documentLabel(selectedDocument)}: ${summary.pages} pages, ${summary.objects} objects. Rendering ${pageSelection} in ${viewModeLabel(viewMode)} mode with ${fontModeLabel(fontMode)} fonts.`);
     const unsupported = new Map();
     const differences = [];
     for (const index of pageIndexes) {
@@ -189,7 +192,7 @@ async function renderSelectedDocument() {
       const canvas = document.createElement("canvas");
       frame.append(label, canvas);
       pageStack.appendChild(frame);
-      const result = await renderPageForMode({ pdf, pdfjsDocument, index, canvas, scale, viewMode });
+      const result = await renderPageForMode({ pdf, pdfjsDocument, index, canvas, scale, viewMode, fontMode });
       for (const [operator, count] of result.unsupportedOperators) {
         unsupported.set(operator, (unsupported.get(operator) || 0) + count);
       }
@@ -201,7 +204,7 @@ async function renderSelectedDocument() {
     await pdfjsDocument?.destroy();
     operatorOutput.textContent = formatUnsupported(unsupported);
     differenceOutput.textContent = formatDifferences(differences);
-    setStatus(`Rendered ${documentLabel(selectedDocument)}: ${pageSelection} in ${viewModeLabel(viewMode)} mode`);
+    setStatus(`Rendered ${documentLabel(selectedDocument)}: ${pageSelection} in ${viewModeLabel(viewMode)} mode with ${fontModeLabel(fontMode)} fonts`);
   } catch (error) {
     if (token === renderToken) {
       setStatus(error.userInput ? error.message : error.stack || error.message, true);
@@ -209,20 +212,20 @@ async function renderSelectedDocument() {
   }
 }
 
-async function renderPageForMode({ pdf, pdfjsDocument, index, canvas, scale, viewMode }) {
+async function renderPageForMode({ pdf, pdfjsDocument, index, canvas, scale, viewMode, fontMode }) {
   if (viewMode === "pdfjs") {
     await renderPdfJsPage(pdfjsDocument, index, canvas, scale);
     return { unsupportedOperators: new Map() };
   }
   if (viewMode === "diff") {
-    return renderDifferencePage(pdf, pdfjsDocument, index, canvas, scale);
+    return renderDifferencePage(pdf, pdfjsDocument, index, canvas, scale, fontMode);
   }
-  return pdf.renderPage(index, canvas, { scale });
+  return pdf.renderPage(index, canvas, { scale, fontMode });
 }
 
-async function renderDifferencePage(pdf, pdfjsDocument, index, canvas, scale) {
+async function renderDifferencePage(pdf, pdfjsDocument, index, canvas, scale, fontMode) {
   const liteCanvas = document.createElement("canvas");
-  const result = await pdf.renderPage(index, liteCanvas, { scale });
+  const result = await pdf.renderPage(index, liteCanvas, { scale, fontMode });
   const pdfjsCanvas = document.createElement("canvas");
   await renderPdfJsPage(pdfjsDocument, index, pdfjsCanvas, scale);
   const difference = paintDifferenceCanvas(canvas, liteCanvas, pdfjsCanvas);
@@ -321,6 +324,10 @@ async function loadPdfJsModule() {
 
 function viewModeLabel(mode) {
   return ({ lite: "pdf-lite", pdfjs: "PDF.js", diff: "difference" })[mode] || mode;
+}
+
+function fontModeLabel(mode) {
+  return ({ stable: "stable", embedded: "embedded outline" })[mode] || mode;
 }
 
 function formatDifference(difference) {
