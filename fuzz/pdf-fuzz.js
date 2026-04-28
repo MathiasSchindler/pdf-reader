@@ -133,7 +133,9 @@ function mutate(input, rng, index) {
 }
 
 function applyMutation(input, rng, salt) {
-  const operation = randomInt(rng, 12);
+  // Bias toward structured PDF-aware mutations (operations 12-19) over pure
+  // random byte twiddling so we hit parser-relevant edge cases more often.
+  const operation = randomInt(rng, 20);
   const bytes = new Uint8Array(input);
   if (!bytes.length) return bytes;
 
@@ -148,7 +150,119 @@ function applyMutation(input, rng, salt) {
   if (operation === 8) return replaceAsciiToken(bytes, rng, "endobj", pick(["endobj", "endstream", "", "endobj\n0 0 obj"], rng));
   if (operation === 9) return replaceNumber(bytes, rng);
   if (operation === 10) return appendTail(bytes, rng, salt);
-  return flipBits(bytes, rng);
+  if (operation === 11) return flipBits(bytes, rng);
+  if (operation === 12) return corruptLength(bytes, rng);
+  if (operation === 13) return corruptMediaBox(bytes, rng);
+  if (operation === 14) return corruptXref(bytes, rng);
+  if (operation === 15) return inflateFilterChain(bytes, rng);
+  if (operation === 16) return injectRecursiveRef(bytes, rng);
+  if (operation === 17) return deepenNesting(bytes, rng);
+  if (operation === 18) return duplicateObject(bytes, rng);
+  return swapDictDelimiters(bytes, rng);
+}
+
+// --- Structured, PDF-aware mutators -----------------------------------------
+// All of these operate on bytes of the user's own fixtures and feed the result
+// back into the user's own renderer in an isolated worker. They are designed
+// to surface parser-level robustness issues (hangs, unbounded allocations,
+// pathological recursion) so they can be fixed.
+
+function corruptLength(bytes, rng) {
+  // Replace the integer in `/Length N` with a misleading value (huge,
+  // negative-ish, or zero) to stress stream length handling.
+  const source = Buffer.from(bytes).toString("latin1");
+  const matches = Array.from(source.matchAll(/\/Length\s+(\d{1,9})/g));
+  if (!matches.length) return flipBits(bytes, rng);
+  const match = pick(matches, rng);
+  const replacement = String(pick([0, 1, 9, 99999999, 2147483647, randomInt(rng, 1_000_000)], rng));
+  const numStart = match.index + match[0].indexOf(match[1]);
+  return spliceReplace(bytes, numStart, match[1].length, Buffer.from(replacement, "latin1"));
+}
+
+function corruptMediaBox(bytes, rng) {
+  // Replace a /MediaBox array with an oversized or malformed variant.
+  const source = Buffer.from(bytes).toString("latin1");
+  const match = /\/MediaBox\s*\[[^\]]{0,200}\]/.exec(source);
+  if (!match) return flipBits(bytes, rng);
+  const replacement = pick([
+    "/MediaBox [0 0 999999 999999]",
+    "/MediaBox [-1 -1 1 1]",
+    "/MediaBox [0 0 0 0]",
+    "/MediaBox []",
+    "/MediaBox [0 0 1e9 1e9]",
+  ], rng);
+  return spliceReplace(bytes, match.index, match[0].length, Buffer.from(replacement, "latin1"));
+}
+
+function corruptXref(bytes, rng) {
+  // Scramble the offsets inside an xref table so lookups point into the wild.
+  const source = Buffer.from(bytes).toString("latin1");
+  const xrefIndex = source.lastIndexOf("xref");
+  if (xrefIndex < 0) return flipBits(bytes, rng);
+  const trailerIndex = source.indexOf("trailer", xrefIndex);
+  const end = trailerIndex > xrefIndex ? trailerIndex : Math.min(source.length, xrefIndex + 4096);
+  const region = source.slice(xrefIndex, end);
+  const mutated = region.replace(/\b(\d{10})\b/g, () => String(randomInt(rng, 9_999_999_999)).padStart(10, "0"));
+  return spliceReplace(bytes, xrefIndex, region.length, Buffer.from(mutated, "latin1"));
+}
+
+function inflateFilterChain(bytes, rng) {
+  // Turn a single /Filter into a long chain to stress decode dispatch.
+  const source = Buffer.from(bytes).toString("latin1");
+  const match = /\/Filter\s*\/([A-Za-z0-9]+)/.exec(source);
+  if (!match) return flipBits(bytes, rng);
+  const count = 2 + randomInt(rng, 12);
+  const chain = `/Filter [${Array.from({ length: count }, () => `/${match[1]}`).join(" ")}]`;
+  return spliceReplace(bytes, match.index, match[0].length, Buffer.from(chain, "latin1"));
+}
+
+function injectRecursiveRef(bytes, rng) {
+  // Rewrite an existing indirect reference so it points back at its own object
+  // number, encouraging cycles in /Parent or /Kids traversal.
+  const source = Buffer.from(bytes).toString("latin1");
+  const objMatch = /\b(\d{1,6})\s+0\s+obj\b/.exec(source);
+  const refMatches = Array.from(source.matchAll(/\b(\d{1,6})\s+0\s+R\b/g));
+  if (!objMatch || !refMatches.length) return flipBits(bytes, rng);
+  const target = pick(refMatches, rng);
+  const replacement = `${objMatch[1]} 0 R`;
+  return spliceReplace(bytes, target.index, target[0].length, Buffer.from(replacement, "latin1"));
+}
+
+function deepenNesting(bytes, rng) {
+  // Insert a long run of dictionary openers without matching closers to make
+  // sure the parser bounds recursion depth instead of blowing the stack.
+  const depth = 32 + randomInt(rng, 96);
+  const blob = "<<".repeat(depth) + " /A 1 ".repeat(depth);
+  const offset = randomInt(rng, bytes.length);
+  return spliceBytes(bytes, offset, Buffer.from(blob, "latin1"));
+}
+
+function duplicateObject(bytes, rng) {
+  // Duplicate a full `N 0 obj ... endobj` block to create conflicting
+  // definitions for the same object id.
+  const source = Buffer.from(bytes).toString("latin1");
+  const blocks = Array.from(source.matchAll(/\b(\d{1,6})\s+0\s+obj[\s\S]{1,4096}?endobj/g)).slice(0, 64);
+  if (!blocks.length) return flipBits(bytes, rng);
+  const block = pick(blocks, rng);
+  return spliceBytes(bytes, block.index + block[0].length, Buffer.from(`\n${block[0]}\n`, "latin1"));
+}
+
+function swapDictDelimiters(bytes, rng) {
+  // Drop or stutter dictionary/array delimiters to surface tokenizer loops.
+  const replacements = [
+    [/<</g, "<"],
+    [/>>/g, ">"],
+    [/<</g, "<<<<"],
+    [/>>/g, ">>>>"],
+    [/\[/g, "[["],
+    [/\]/g, "]]"],
+  ];
+  const [pattern, replacement] = pick(replacements, rng);
+  const source = Buffer.from(bytes).toString("latin1");
+  const matches = Array.from(source.matchAll(pattern));
+  if (!matches.length) return flipBits(bytes, rng);
+  const target = pick(matches, rng);
+  return spliceReplace(bytes, target.index, target[0].length, Buffer.from(replacement, "latin1"));
 }
 
 function spliceBytes(bytes, offset, inserted) {
