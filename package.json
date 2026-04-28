@@ -11,6 +11,8 @@
     "fuzz:epic": "node fuzz/pdf-fuzz.js --mode=epic",
     "fuzz:render": "node fuzz/render-fuzz.js",
     "fuzz:oracle": "node fuzz/oracle-fuzz.js",
+    "fuzz:regression": "node fuzz/regression-run.js",
+    "test:security": "node scripts/security-tests.js",
     "size": "node scripts/build.js"
   },
   "devDependencies": {

@@ -15,20 +15,44 @@ const ENABLE_IMAGES = typeof PDF_LITE_IMAGES === "boolean" ? PDF_LITE_IMAGES : t
 // Generous caps that real PDFs never approach but that keep pathological or
 // adversarial inputs bounded. These turn would-be hangs and runaway
 // allocations into fast, deterministic errors.
-const MAX_OBJECTS = 200_000;
-const MAX_PAGES = 10_000;
-const MAX_PAGE_DEPTH = 64;
-const MAX_PAGE_KIDS = 8192;
-const MAX_PAGE_DIMENSION_PX = 16384; // upper bound on canvas width/height
-const MAX_CONTENT_STREAM_BYTES = 64 * 1024 * 1024; // combined per page
+export const DEFAULT_SECURITY_LIMITS = Object.freeze({
+  maxInputBytes: 128 * 1024 * 1024,
+  maxObjects: 200_000,
+  maxObjectStreams: 4096,
+  maxObjectsPerObjectStream: 10_000,
+  maxPages: 10_000,
+  maxPageDepth: 64,
+  maxPageKids: 8192,
+  maxPageDimensionPx: 16_384,
+  maxContentStreamBytes: 64 * 1024 * 1024,
+  maxContentTokens: 1_000_000,
+  maxContentOperators: 250_000,
+  maxOperands: 4096,
+  maxGraphicsStackDepth: 256,
+  maxFormXObjectDepth: 12,
+  maxDecodedStreamBytes: 64 * 1024 * 1024,
+  maxDecodedDocumentBytes: 256 * 1024 * 1024,
+  maxImageDimension: 8192,
+  maxImagePixels: 25_000_000,
+  maxFontBytes: 32 * 1024 * 1024,
+  maxCMapEntries: 65_536,
+  maxIndexedPaletteEntries: 4096,
+  maxAuditNodes: 200_000,
+});
 
-export async function loadPdfLite(url) {
-  const response = await fetch(url);
+const ACTIVE_CONTENT_KEYS = new Set(["OpenAction", "AA", "JavaScript", "JS", "Launch", "SubmitForm", "GoToR", "URI", "EmbeddedFile", "RichMedia", "XFA"]);
+const ACTIVE_CONTENT_TYPES = new Set(["Action", "Filespec", "EmbeddedFile", "RichMedia", "XFA", "JavaScript", "Launch", "SubmitForm", "GoToR", "URI"]);
+
+export async function loadPdfLite(url, options = {}) {
+  const limits = securityLimits(options.limits);
+  assertNotAborted(options.signal);
+  const response = await fetch(url, { signal: options.signal });
   if (!response.ok) {
     throw new Error(`Could not fetch ${url}: ${response.status}`);
   }
   const bytes = new Uint8Array(await response.arrayBuffer());
-  const pdf = new PdfLiteDocument(bytes, url);
+  assertWithinLimit("Input PDF size", bytes.byteLength, limits.maxInputBytes);
+  const pdf = new PdfLiteDocument(bytes, url, { limits, signal: options.signal });
   await pdf.parse();
   // Reject obviously broken files that parsed to nothing useful. These are
   // structural minimums; any real PDF clears them trivially. Rejecting here
@@ -46,9 +70,11 @@ export async function loadPdfLite(url) {
 }
 
 class PdfLiteDocument {
-  constructor(bytes, url) {
+  constructor(bytes, url, options = {}) {
     this.bytes = bytes;
     this.url = url;
+    this.limits = securityLimits(options.limits);
+    this.signal = options.signal || null;
     this.source = bytesToBinaryString(bytes);
     this.objects = new Map();
     this.directObjects = 0;
@@ -58,13 +84,25 @@ class PdfLiteDocument {
     this.fonts = new Map();
     this.pages = [];
     this.warnings = [];
+    this.activeContent = new Map();
+    this.decodedDocumentBytes = 0;
   }
 
   async parse() {
+    this.checkpoint();
     this.readDirectObjects();
     await this.readObjectStreams();
     this.collectPages();
     await this.collectFonts();
+    this.auditActiveContent();
+  }
+
+  checkpoint() {
+    assertNotAborted(this.signal);
+  }
+
+  limit(name, value, maximum) {
+    assertWithinLimit(name, value, maximum);
   }
 
   audit() {
@@ -101,6 +139,8 @@ class PdfLiteDocument {
         defaultWidth: font.defaultWidth,
       })),
       images: this.imageAudit(),
+      activeContent: Object.fromEntries(Array.from(this.activeContent).sort()),
+      limits: { ...this.limits },
       warnings: this.warnings,
     };
   }
@@ -124,6 +164,53 @@ class PdfLiteDocument {
       }));
   }
 
+  auditActiveContent() {
+    if (!ENABLE_DIAGNOSTICS) {
+      return;
+    }
+    const visited = new Set();
+    let scanned = 0;
+    const record = (name) => {
+      this.activeContent.set(name, (this.activeContent.get(name) || 0) + 1);
+    };
+    const visit = (value) => {
+      this.checkpoint();
+      if (!value || typeof value !== "object" || scanned >= this.limits.maxAuditNodes) {
+        return;
+      }
+      if (visited.has(value)) {
+        return;
+      }
+      visited.add(value);
+      scanned += 1;
+      if (Array.isArray(value)) {
+        for (const item of value) visit(this.resolve(item));
+        return;
+      }
+      const type = this.resolve(value.Type);
+      const subtype = this.resolve(value.Subtype);
+      const actionType = this.resolve(value.S);
+      for (const marker of [type, subtype, actionType]) {
+        if (typeof marker === "string" && ACTIVE_CONTENT_TYPES.has(marker)) {
+          record(marker);
+        }
+      }
+      for (const [key, child] of Object.entries(value)) {
+        if (ACTIVE_CONTENT_KEYS.has(key)) {
+          record(key);
+        }
+        visit(this.resolve(child));
+      }
+    };
+    for (const object of this.objects.values()) {
+      visit(object.value);
+      if (scanned >= this.limits.maxAuditNodes) {
+        this.warnings.push(`Active-content audit truncated at ${this.limits.maxAuditNodes} nodes.`);
+        break;
+      }
+    }
+  }
+
   resolveColorSpace(value) {
     const colorSpace = this.resolve(value);
     if (Array.isArray(colorSpace)) {
@@ -133,6 +220,7 @@ class PdfLiteDocument {
   }
 
   async renderPage(index, canvas, options = {}) {
+    this.checkpoint();
     const page = this.pages[index];
     if (!page) {
       throw new Error(`Page ${index + 1} not found`);
@@ -152,8 +240,8 @@ class PdfLiteDocument {
     const width = rotation === 90 || rotation === 270 ? boxHeight : boxWidth;
     const height = rotation === 90 || rotation === 270 ? boxWidth : boxHeight;
     const pixelRatio = window.devicePixelRatio || 1;
-    const pixelWidth = Math.min(MAX_PAGE_DIMENSION_PX, Math.max(1, Math.floor(width * scale * pixelRatio)));
-    const pixelHeight = Math.min(MAX_PAGE_DIMENSION_PX, Math.max(1, Math.floor(height * scale * pixelRatio)));
+    const pixelWidth = Math.min(this.limits.maxPageDimensionPx, Math.max(1, Math.floor(width * scale * pixelRatio)));
+    const pixelHeight = Math.min(this.limits.maxPageDimensionPx, Math.max(1, Math.floor(height * scale * pixelRatio)));
     canvas.width = pixelWidth;
     canvas.height = pixelHeight;
     canvas.style.width = `${Math.floor(width * scale)}px`;
@@ -162,18 +250,19 @@ class PdfLiteDocument {
     context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
     context.fillStyle = "#fff";
     context.fillRect(0, 0, width * scale, height * scale);
-    const renderer = new ContentRenderer(this, page, context, { scale, width, height, boxWidth, boxHeight, rotation, originX: pageBox[0], originY: pageBox[1], fontMode: options.fontMode || "stable" });
+    const renderer = new ContentRenderer(this, page, context, { scale, width, height, boxWidth, boxHeight, rotation, originX: pageBox[0], originY: pageBox[1], fontMode: options.fontMode || "stable", signal: options.signal });
     const streams = await this.getPageContentStreams(page);
     let totalBytes = 0;
     const safeStreams = [];
     for (const stream of streams) {
       totalBytes += stream.length;
-      if (totalBytes > MAX_CONTENT_STREAM_BYTES) {
-        if (ENABLE_DIAGNOSTICS) this.warnings.push(`Content stream truncated at ${MAX_CONTENT_STREAM_BYTES} bytes for page ${index + 1}.`);
+      if (totalBytes > this.limits.maxContentStreamBytes) {
+        if (ENABLE_DIAGNOSTICS) this.warnings.push(`Content stream truncated at ${this.limits.maxContentStreamBytes} bytes for page ${index + 1}.`);
         break;
       }
       safeStreams.push(stream);
     }
+    this.checkpoint();
     await renderer.interpret(safeStreams.map((stream) => bytesToBinaryString(stream)).join("\n"));
     return { unsupportedOperators: ENABLE_DIAGNOSTICS ? renderer.unsupportedOperators : new Map() };
   }
@@ -182,8 +271,9 @@ class PdfLiteDocument {
     const objectPattern = /(\d+)\s+(\d+)\s+obj\b/g;
     let match;
     while ((match = objectPattern.exec(this.source))) {
-      if (this.objects.size >= MAX_OBJECTS) {
-        if (ENABLE_DIAGNOSTICS) this.warnings.push(`Object limit reached (${MAX_OBJECTS}); ignoring remaining objects.`);
+      this.checkpoint();
+      if (this.objects.size >= this.limits.maxObjects) {
+        if (ENABLE_DIAGNOSTICS) this.warnings.push(`Object limit reached (${this.limits.maxObjects}); ignoring remaining objects.`);
         break;
       }
       const id = Number(match[1]);
@@ -206,11 +296,20 @@ class PdfLiteDocument {
   async readObjectStreams() {
     const streams = Array.from(this.objects.values()).filter((object) => object.value?.Type === "ObjStm" && object.stream);
     this.objectStreams = streams.length;
-    for (const object of streams) {
+    const streamLimit = Math.min(streams.length, this.limits.maxObjectStreams);
+    if (streams.length > this.limits.maxObjectStreams && ENABLE_DIAGNOSTICS) {
+      this.warnings.push(`Object stream list truncated from ${streams.length} to ${this.limits.maxObjectStreams}.`);
+    }
+    for (const object of streams.slice(0, streamLimit)) {
+      this.checkpoint();
       try {
         const decoded = await this.decodeStream(object.stream.bytes, object.value);
         const headerLength = Number(resolvePrimitive(this, object.value.First)) || 0;
-        const objectCount = Number(resolvePrimitive(this, object.value.N)) || 0;
+        const declaredObjectCount = Number(resolvePrimitive(this, object.value.N)) || 0;
+        const objectCount = Math.min(declaredObjectCount, this.limits.maxObjectsPerObjectStream);
+        if (declaredObjectCount > this.limits.maxObjectsPerObjectStream && ENABLE_DIAGNOSTICS) {
+          this.warnings.push(`Object stream ${object.id} truncated from ${declaredObjectCount} to ${this.limits.maxObjectsPerObjectStream} objects.`);
+        }
         const decodedText = bytesToBinaryString(decoded);
         const header = decodedText.slice(0, headerLength).trim().split(/\s+/).map(Number);
         const body = decodedText.slice(headerLength);
@@ -244,14 +343,15 @@ class PdfLiteDocument {
   }
 
   walkPages(node, inherited, depth = 0, visited = new Set()) {
+    this.checkpoint();
     if (!node) {
       return;
     }
-    if (depth > MAX_PAGE_DEPTH) {
-      if (ENABLE_DIAGNOSTICS) this.warnings.push(`Page tree depth limit (${MAX_PAGE_DEPTH}) reached.`);
+    if (depth > this.limits.maxPageDepth) {
+      if (ENABLE_DIAGNOSTICS) this.warnings.push(`Page tree depth limit (${this.limits.maxPageDepth}) reached.`);
       return;
     }
-    if (this.pages.length >= MAX_PAGES) {
+    if (this.pages.length >= this.limits.maxPages) {
       return;
     }
     if (typeof node === "object" && node !== null) {
@@ -279,18 +379,19 @@ class PdfLiteDocument {
       return;
     }
     const kids = this.resolve(node.Kids) || [];
-    const limit = Math.min(kids.length, MAX_PAGE_KIDS);
-    if (kids.length > MAX_PAGE_KIDS && ENABLE_DIAGNOSTICS) {
-      this.warnings.push(`Page kids array truncated from ${kids.length} to ${MAX_PAGE_KIDS}.`);
+    const limit = Math.min(kids.length, this.limits.maxPageKids);
+    if (kids.length > this.limits.maxPageKids && ENABLE_DIAGNOSTICS) {
+      this.warnings.push(`Page kids array truncated from ${kids.length} to ${this.limits.maxPageKids}.`);
     }
     for (let index = 0; index < limit; index += 1) {
-      if (this.pages.length >= MAX_PAGES) break;
+      if (this.pages.length >= this.limits.maxPages) break;
       this.walkPages(this.resolve(kids[index]), nextInherited, depth + 1, visited);
     }
   }
 
   async collectFonts() {
     for (const page of this.pages) {
+      this.checkpoint();
       const fonts = this.resolve(page.resources?.Font) || {};
       for (const [resourceName, fontRef] of Object.entries(fonts)) {
         const objectId = fontRef?.ref || `${resourceName}:${Object.keys(this.fonts).length}`;
@@ -305,7 +406,7 @@ class PdfLiteDocument {
           if (cmapObject?.stream) {
             try {
               const cmapBytes = await this.decodeStream(cmapObject.stream.bytes, cmapObject.value);
-              toUnicode = parseToUnicodeCMap(bytesToBinaryString(cmapBytes));
+              toUnicode = parseToUnicodeCMap(bytesToBinaryString(cmapBytes), this.limits.maxCMapEntries);
             } catch (error) {
               if (ENABLE_DIAGNOSTICS) {
                 this.warnings.push(`Could not decode ToUnicode map for ${resourceName}: ${error.message}`);
@@ -361,6 +462,7 @@ class PdfLiteDocument {
     let bytes;
     try {
       bytes = await this.decodeStream(object.stream.bytes, object.value);
+      this.limit(`Embedded font ${object.id} size`, bytes.byteLength, this.limits.maxFontBytes);
       embedded.bytes = bytes;
       if (format === "truetype") {
         embedded.outlineFont = parseTrueTypeFont(bytes);
@@ -394,18 +496,22 @@ class PdfLiteDocument {
     const filters = normalizeFilters(this.resolve(dictionary.Filter));
     let output = bytes;
     for (const filter of filters) {
+      this.checkpoint();
       if (filter === "FlateDecode" || filter === "Fl") {
-        output = await inflate(output);
+        output = await inflate(output, this.limits.maxDecodedStreamBytes, this.signal);
       } else if (filter === "ASCIIHexDecode" || filter === "AHx") {
-        output = decodeAsciiHex(output);
+        output = decodeAsciiHex(output, this.limits.maxDecodedStreamBytes);
       } else if (filter === "ASCII85Decode" || filter === "A85") {
-        output = decodeAscii85(output);
+        output = decodeAscii85(output, this.limits.maxDecodedStreamBytes);
       } else if (filter === "RunLengthDecode" || filter === "RL") {
-        output = decodeRunLength(output);
+        output = decodeRunLength(output, this.limits.maxDecodedStreamBytes);
       } else {
         throw new Error(`Unsupported stream filter ${filter}`);
       }
+      this.limit("Decoded stream size", output.byteLength, this.limits.maxDecodedStreamBytes);
     }
+    this.decodedDocumentBytes += output.byteLength;
+    this.limit("Decoded document stream bytes", this.decodedDocumentBytes, this.limits.maxDecodedDocumentBytes);
     return output;
   }
 
@@ -438,6 +544,7 @@ class ContentRenderer {
     this.originX = metrics.originX || 0;
     this.originY = metrics.originY || 0;
     this.fontMode = metrics.fontMode || "stable";
+    this.signal = metrics.signal || pdf.signal || null;
     this.stack = [];
     this.state = this.defaultState();
     this.unsupportedOperators = ENABLE_DIAGNOSTICS ? new Map() : null;
@@ -477,12 +584,22 @@ class ContentRenderer {
   }
 
   async interpret(content) {
-    const tokens = tokenizeContent(content);
+    assertNotAborted(this.signal);
+    const tokens = tokenizeContent(content, this.pdf.limits.maxContentTokens);
     const operands = [];
+    let operators = 0;
     for (const token of tokens) {
+      assertNotAborted(this.signal);
       if (token.type !== "operator") {
         operands.push(token.value);
+        if (operands.length > this.pdf.limits.maxOperands) {
+          throw new Error(`PDF limit exceeded: content operands > ${this.pdf.limits.maxOperands}`);
+        }
         continue;
+      }
+      operators += 1;
+      if (operators > this.pdf.limits.maxContentOperators) {
+        throw new Error(`PDF limit exceeded: content operators > ${this.pdf.limits.maxContentOperators}`);
       }
       await this.applyOperator(token.value, operands.splice(0));
     }
@@ -491,6 +608,10 @@ class ContentRenderer {
   async applyOperator(operator, operands) {
     switch (operator) {
       case "q":
+        if (this.stack.length >= this.pdf.limits.maxGraphicsStackDepth) {
+          this.unsupported("q/StackDepth");
+          break;
+        }
         this.stack.push(structuredClone(this.state));
         this.context.save();
         break;
@@ -906,7 +1027,7 @@ class ContentRenderer {
   }
 
   async paintFormXObject(object) {
-    if (this.xObjectDepth > 12) {
+    if (this.xObjectDepth >= this.pdf.limits.maxFormXObjectDepth) {
       this.unsupported("Do/FormDepth");
       return;
     }
@@ -1064,6 +1185,10 @@ class ContentRenderer {
 async function paintImageXObject(renderer, object) {
   const filters = normalizeFilters(renderer.pdf.resolve(object.value.Filter));
   try {
+    if (!validateImageBudget(renderer, object.value)) {
+      renderer.unsupported("Do/ImageLimit");
+      return;
+    }
     if (filters.length === 1 && ["DCTDecode", "DCT"].includes(filters[0])) {
       const image = await createImageBitmap(new Blob([object.stream.bytes], { type: "image/jpeg" }));
       drawUnitImage(renderer, image);
@@ -1098,12 +1223,27 @@ function drawUnitImage(renderer, image, options = {}) {
   renderer.context.restore();
 }
 
+function validateImageBudget(renderer, dictionary) {
+  const width = Number(renderer.pdf.resolve(dictionary.Width));
+  const height = Number(renderer.pdf.resolve(dictionary.Height));
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+    return false;
+  }
+  if (width > renderer.pdf.limits.maxImageDimension || height > renderer.pdf.limits.maxImageDimension) {
+    return false;
+  }
+  if (width * height > renderer.pdf.limits.maxImagePixels) {
+    return false;
+  }
+  return true;
+}
+
 async function imageDataForXObject(renderer, object) {
   const dictionary = object.value;
   const width = Number(renderer.pdf.resolve(dictionary.Width));
   const height = Number(renderer.pdf.resolve(dictionary.Height));
   const bits = Number(renderer.pdf.resolve(dictionary.BitsPerComponent));
-  if (!Number.isFinite(width) || !Number.isFinite(height) || !Number.isFinite(bits)) {
+  if (!validateImageBudget(renderer, dictionary) || !Number.isFinite(bits)) {
     return null;
   }
   const colorSpace = renderer.pdf.resolve(dictionary.ColorSpace);
@@ -1169,7 +1309,7 @@ async function imageAlphaForXObject(renderer, dictionary, width, height) {
   const maskWidth = Number(renderer.pdf.resolve(mask.Width));
   const maskHeight = Number(renderer.pdf.resolve(mask.Height));
   const bits = Number(renderer.pdf.resolve(mask.BitsPerComponent));
-  if (maskWidth !== width || maskHeight !== height || bits !== 8) {
+  if (maskWidth !== width || maskHeight !== height || bits !== 8 || !validateImageBudget(renderer, mask)) {
     return null;
   }
   const filters = normalizeFilters(renderer.pdf.resolve(mask.Filter));
@@ -1396,10 +1536,13 @@ function streamLength(source, value) {
   return match ? Number(match[1]) : NaN;
 }
 
-function tokenizeContent(source) {
+function tokenizeContent(source, maxTokens = DEFAULT_SECURITY_LIMITS.maxContentTokens) {
   const parser = new PdfValueParser(source);
   const tokens = [];
   while (parser.position < source.length) {
+    if (tokens.length >= maxTokens) {
+      throw new Error(`PDF limit exceeded: content tokens > ${maxTokens}`);
+    }
     parser.skipWhitespace();
     if (parser.position >= source.length) {
       break;
@@ -1420,18 +1563,37 @@ function tokenizeContent(source) {
   return tokens;
 }
 
-async function inflate(bytes) {
-  if (!window.DecompressionStream) {
+async function inflate(bytes, maxBytes = DEFAULT_SECURITY_LIMITS.maxDecodedStreamBytes, signal = null) {
+  const Decompression = globalThis.DecompressionStream;
+  if (!Decompression) {
     throw new Error("This browser does not expose DecompressionStream for FlateDecode");
   }
-  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
-  return new Uint8Array(await new Response(stream).arrayBuffer());
+  const stream = new Blob([bytes]).stream().pipeThrough(new Decompression("deflate"));
+  const reader = stream.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    assertNotAborted(signal);
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    assertWithinLimit("Decoded Flate stream size", total, maxBytes);
+    chunks.push(value);
+  }
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return output;
 }
 
-function decodeAsciiHex(bytes) {
+function decodeAsciiHex(bytes, maxBytes = DEFAULT_SECURITY_LIMITS.maxDecodedStreamBytes) {
   const source = bytesToBinaryString(bytes).replace(/\s+/g, "");
   const hex = source.replace(/>.*/, "");
   const padded = hex.length % 2 ? `${hex}0` : hex;
+  assertWithinLimit("Decoded ASCIIHex stream size", padded.length / 2, maxBytes);
   const output = new Uint8Array(padded.length / 2);
   for (let index = 0; index < padded.length; index += 2) {
     output[index / 2] = parseInt(padded.slice(index, index + 2), 16) || 0;
@@ -1439,13 +1601,14 @@ function decodeAsciiHex(bytes) {
   return output;
 }
 
-function decodeAscii85(bytes) {
+function decodeAscii85(bytes, maxBytes = DEFAULT_SECURITY_LIMITS.maxDecodedStreamBytes) {
   const source = bytesToBinaryString(bytes).replace(/\s+/g, "").replace(/^<~/, "").replace(/~>$/, "");
   const output = [];
   let group = [];
   for (const char of source) {
     if (char === "z" && !group.length) {
       output.push(0, 0, 0, 0);
+      assertWithinLimit("Decoded ASCII85 stream size", output.length, maxBytes);
       continue;
     }
     const code = char.charCodeAt(0);
@@ -1455,6 +1618,7 @@ function decodeAscii85(bytes) {
     group.push(code - 33);
     if (group.length === 5) {
       appendAscii85Group(output, group, 4);
+      assertWithinLimit("Decoded ASCII85 stream size", output.length, maxBytes);
       group = [];
     }
   }
@@ -1464,6 +1628,7 @@ function decodeAscii85(bytes) {
       group.push(84);
     }
     appendAscii85Group(output, group, outputBytes);
+    assertWithinLimit("Decoded ASCII85 stream size", output.length, maxBytes);
   }
   return new Uint8Array(output);
 }
@@ -1479,7 +1644,7 @@ function appendAscii85Group(output, group, byteCount) {
   if (byteCount > 3) output.push(value & 0xff);
 }
 
-function decodeRunLength(bytes) {
+function decodeRunLength(bytes, maxBytes = DEFAULT_SECURITY_LIMITS.maxDecodedStreamBytes) {
   const output = [];
   for (let index = 0; index < bytes.length;) {
     const length = bytes[index++];
@@ -1497,6 +1662,7 @@ function decodeRunLength(bytes) {
         output.push(value);
       }
     }
+    assertWithinLimit("Decoded RunLength stream size", output.length, maxBytes);
   }
   return new Uint8Array(output);
 }
@@ -1685,6 +1851,9 @@ async function indexedColorPalette(pdf, colorSpace) {
   const lookup = colorSpace[3];
   const componentCount = paletteComponentCount(baseColorSpace);
   if (!Number.isFinite(highValue) || componentCount < 1) {
+    return null;
+  }
+  if (highValue + 1 > pdf.limits.maxIndexedPaletteEntries) {
     return null;
   }
   const lookupBytes = await lookupBytesFor(pdf, lookup);
@@ -1913,13 +2082,14 @@ function decodeImageComponent(value, low, high) {
   return colorComponent(low + (value / 255) * (high - low));
 }
 
-function parseToUnicodeCMap(source) {
+function parseToUnicodeCMap(source, maxEntries = DEFAULT_SECURITY_LIMITS.maxCMapEntries) {
   const map = new Map();
   const bfcharPattern = /beginbfchar([\s\S]*?)endbfchar/g;
   let match;
   while ((match = bfcharPattern.exec(source))) {
     const pairs = Array.from(match[1].matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g));
     for (const pair of pairs) {
+      if (map.size >= maxEntries) return map;
       map.set(pair[1].toUpperCase(), hexToUnicode(pair[2]));
     }
   }
@@ -1932,6 +2102,7 @@ function parseToUnicodeCMap(source) {
       const target = hexToUnicode(range[3]);
       const width = range[1].length;
       for (let code = start; code <= end && code - start < 512; code += 1) {
+        if (map.size >= maxEntries) return map;
         map.set(code.toString(16).toUpperCase().padStart(width, "0"), incrementUnicodeString(target, code - start));
       }
     }
@@ -1942,6 +2113,7 @@ function parseToUnicodeCMap(source) {
       const width = range[1].length;
       const targets = Array.from(range[3].matchAll(/<([0-9a-fA-F]+)>/g)).map((target) => target[1]);
       for (let offset = 0; offset < targets.length && start + offset <= end; offset += 1) {
+        if (map.size >= maxEntries) return map;
         map.set((start + offset).toString(16).toUpperCase().padStart(width, "0"), hexToUnicode(targets[offset]));
       }
     }
@@ -2153,6 +2325,28 @@ function colorComponent(value) {
 
 function clamp01(value) {
   return Math.min(1, Math.max(0, Number(value) || 0));
+}
+
+function securityLimits(overrides = {}) {
+  const limits = { ...DEFAULT_SECURITY_LIMITS };
+  for (const [key, value] of Object.entries(overrides || {})) {
+    if (key in limits && Number.isFinite(Number(value)) && Number(value) > 0) {
+      limits[key] = Number(value);
+    }
+  }
+  return Object.freeze(limits);
+}
+
+function assertNotAborted(signal) {
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error ? signal.reason : new Error("PDF operation aborted");
+  }
+}
+
+function assertWithinLimit(name, value, maximum) {
+  if (Number.isFinite(maximum) && value > maximum) {
+    throw new Error(`PDF limit exceeded: ${name} ${value} > ${maximum}`);
+  }
 }
 
 function canvasFontFor(font, fontSize) {

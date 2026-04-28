@@ -149,6 +149,49 @@ The manifest is expected to define `BT_DRUCKSACHEN`, with entries containing at 
 
 Entries can also provide `pdfUrl` directly.
 
+## Defensive Fuzzing
+
+This repository includes a local fuzzing harness for defensive robustness testing of pdf-crumb against malformed or adversarial PDF inputs. The harness mutates the project's own fixture PDFs, feeds the mutated bytes to the parser and renderer, and reports crashes, hangs, uncaught browser exceptions, and semantic disagreements with PDF.js. It is intended to harden this reader against untrusted third-party PDF content; it does not generate exploits or target other software or systems.
+
+Run the fast parser smoke test:
+
+```text
+npm run fuzz:smoke -- --seed=20260428
+```
+
+Run broader parser, browser-render, and PDF.js oracle fuzzing:
+
+```text
+npm run fuzz -- --seed=20260428
+npm run fuzz:render -- --cases=300 --seed=20260428
+npm run fuzz:oracle -- --cases=300 --seed=20260428
+```
+
+Useful options:
+
+```text
+--cases=N       number of generated inputs
+--seed=N        deterministic random seed for reproduction
+--timeout=MS    per-case timeout budget
+--replay=PATH   parser-stage replay of a saved artifact
+```
+
+Unexpected parser outcomes are saved under `fuzz/artifacts/`, browser-render findings under `fuzz/artifacts-render/`, and oracle mismatches under `fuzz/artifacts-oracle/`. These paths are ignored by git because fuzz artifacts are generated inputs and may be numerous. A finding should be treated as a local robustness bug until investigated: timeouts usually point to missing bounds, page errors to uncaught renderer faults, and oracle mismatches to parser behavior that should be compared against the reference implementation before changing accept/reject policy.
+
+Minimized artifacts that should become permanent coverage can be copied into `fixtures/regression/` and replayed with:
+
+```text
+npm run fuzz:regression
+```
+
+Deterministic browser security checks cover active-content auditing, input limits, abort handling, decoded stream limits, image allocation limits, and content-operator limits:
+
+```text
+npm run test:security
+```
+
+The public loader accepts optional `limits` and `signal` settings. See [SECURITY.md](SECURITY.md) for the security boundary, default defensive posture, and deployment recommendations for untrusted PDFs.
+
 ## Repository Hygiene
 
 The repository intentionally ignores:
