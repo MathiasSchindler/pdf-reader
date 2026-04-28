@@ -2,8 +2,11 @@
 .DS_Store
 
 # Third-party and local/copyrighted sample corpora
-vendor/
-pdf-files/
+vendor/*
+!vendor/pdfjs/
+!vendor/pdfjs/**
+pdf-files/*
+!pdf-files/PDF.pdf
 
 # Local editor/runtime noise
 .vscode/

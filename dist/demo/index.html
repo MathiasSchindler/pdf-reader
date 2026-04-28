@@ -146,7 +146,7 @@
   <script type="module">
     import { loadPdfCrumb } from "../pdf-crumb.viewer.min.js";
 
-    const sampleUrl = "./sample.pdf";
+    const sampleUrl = "../../pdf-files/PDF.pdf";
     const canvas = document.getElementById("page-canvas");
     const status = document.getElementById("status");
     const fileInput = document.getElementById("file-input");
@@ -160,7 +160,7 @@
     let pageIndex = 0;
     let objectUrl = null;
 
-    sampleButton.addEventListener("click", () => loadDocument(sampleUrl, "sample.pdf"));
+    sampleButton.addEventListener("click", () => loadDocument(sampleUrl, "PDF.pdf"));
     previousButton.addEventListener("click", () => renderPage(pageIndex - 1));
     nextButton.addEventListener("click", () => renderPage(pageIndex + 1));
     scaleInput.addEventListener("change", () => renderPage(pageIndex));
@@ -232,7 +232,7 @@
     }
 
   updateButtons();
-  loadDocument(sampleUrl, "sample.pdf");
+  loadDocument(sampleUrl, "PDF.pdf");
   </script>
 </body>
 </html>

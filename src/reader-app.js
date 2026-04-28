@@ -315,7 +315,7 @@ async function loadPdfJsDocument(url) {
 async function loadPdfJsModule() {
   if (!pdfjsModulePromise) {
     pdfjsModulePromise = import("../vendor/pdfjs/pdf.mjs").then((pdfjs) => {
-      pdfjs.GlobalWorkerOptions.workerSrc = "./vendor/pdfjs/pdf.worker.mjs";
+      pdfjs.GlobalWorkerOptions.workerSrc = new URL("../vendor/pdfjs/pdf.worker.mjs", import.meta.url).href;
       return pdfjs;
     });
   }

@@ -8,7 +8,7 @@ The project is not a conformance-grade PDF implementation. It is useful as a com
 
 This project is released under CC0-1.0. See [LICENSE](LICENSE).
 
-The code base was written with substantial LLM assistance, mostly GPT-5.5, with human direction, testing, and review throughout. See [NOTICE.md](NOTICE.md).
+The code base was written with substantial LLM assistance, mostly GPT-5.5, with human direction, testing, and review throughout. See [NOTICE.md](NOTICE.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Try It
 
@@ -26,7 +26,8 @@ http://localhost:8787/
 
 Useful local pages:
 
-- `http://localhost:8787/dist/demo/`: minimal distribution demo using the viewer bundle, a bundled sample PDF, file upload, and drag/drop.
+- `http://localhost:8787/`: project page with a live pdf-crumb.js render of `pdf-files/PDF.pdf`.
+- `http://localhost:8787/dist/demo/`: minimal distribution demo using the viewer bundle, the same sample PDF, file upload, and drag/drop.
 - `http://localhost:8787/dev/`: development reader with sample selection, PDF.js comparison mode, difference view, renderer audit, and font-mode controls.
 
 ## Install And Build
@@ -104,6 +105,7 @@ pdf-reader/
   index.html                 project page
   dev/index.html             development reader UI
   dist/demo/index.html       minimal embeddable demo
+  pdf-files/PDF.pdf          freely licensed public sample PDF
   samples.js                 local development manifest
   styles.css                 development reader styles
   fixtures/                  commit-safe fixture PDFs
@@ -121,11 +123,11 @@ The renderer source should stay independent of the development reader UI. It sho
 
 ## Development Reader
 
-The development reader loads `samples.js` by default. The manifest includes generated fixture PDFs from `fixtures/` and references local PDFs below `pdf-files/` when that ignored corpus is present.
+The development reader loads `samples.js` by default. The manifest includes generated fixture PDFs from `fixtures/`, the public `pdf-files/PDF.pdf` Wikipedia sample, and references local PDFs below `pdf-files/` when that ignored corpus is present.
 
 The `Pages` control accepts `all`, a single page such as `3`, a range such as `1-5`, or a comma-separated list such as `1,3,7-9`. The `View` control switches between pdf-crumb, PDF.js, and Difference. The difference view renders the same selected pages through both engines, compares pixels, and paints matching pixels black. Pixels where pdf-crumb is brighter are red; pixels where PDF.js is brighter are green.
 
-PDF.js is only a development comparator in this project. It is not a fallback renderer for pdf-crumb, and production behavior should not silently switch to PDF.js when pdf-crumb lacks a feature.
+PDF.js is only a development comparator in this project. It is not a fallback renderer for pdf-crumb, and production behavior should not silently switch to PDF.js when pdf-crumb lacks a feature. The vendored files in `vendor/pdfjs/` retain the Mozilla Foundation copyright and Apache-2.0 license notices; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 The manifest and PDF base path can be overridden from the development reader URL:
 
@@ -151,8 +153,8 @@ Entries can also provide `pdfUrl` directly.
 
 The repository intentionally ignores:
 
-- `vendor/`, because PDF.js is third-party comparison material.
-- `pdf-files/`, because the local PDF corpus may contain copyrighted documents.
+- most of `vendor/`, while allowing `vendor/pdfjs/` so a fresh checkout can run the development PDF.js comparison view with its original license notices intact.
+- most of `pdf-files/`, because the local PDF corpus may contain copyrighted documents. `pdf-files/PDF.pdf` is allowed as the public freely licensed sample.
 - `node_modules/`, because dependencies are restored through `npm install`.
 
 Keep generated or self-authored fixtures in `fixtures/` when they are safe to commit.

@@ -14,6 +14,13 @@ const BT_DRUCKSACHEN = [
     pdfUrl: "fixtures/pdf-lite-rotation.pdf"
   },
   {
+    id: "wikipedia-pdf",
+    number: "sample/1",
+    type: "Wikipedia export",
+    title: "Wikipedia article: PDF",
+    pdfUrl: "pdf-files/PDF.pdf"
+  },
+  {
     id: "pdf-lite-stream-filters",
     number: "fixture/3",
     type: "generated",
