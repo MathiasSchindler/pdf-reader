@@ -123,13 +123,13 @@ The renderer source should stay independent of the development reader UI. It sho
 
 ## Development Reader
 
-The development reader loads `samples.js` by default. The manifest includes generated fixture PDFs from `fixtures/`, the public `pdf-files/PDF.pdf` Wikipedia sample, and references local PDFs below `pdf-files/` when that ignored corpus is present.
+The development reader loads `samples.js` by default. The default manifest includes only generated fixture PDFs from `fixtures/` and the public `pdf-files/PDF.pdf` Wikipedia sample, so a fresh checkout does not list private or copyright-sensitive local corpus files.
 
 The `Pages` control accepts `all`, a single page such as `3`, a range such as `1-5`, or a comma-separated list such as `1,3,7-9`. The `View` control switches between pdf-crumb, PDF.js, and Difference. The difference view renders the same selected pages through both engines, compares pixels, and paints matching pixels black. Pixels where pdf-crumb is brighter are red; pixels where PDF.js is brighter are green.
 
 PDF.js is only a development comparator in this project. It is not a fallback renderer for pdf-crumb, and production behavior should not silently switch to PDF.js when pdf-crumb lacks a feature. The vendored files in `vendor/pdfjs/` retain the Mozilla Foundation copyright and Apache-2.0 license notices; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-The manifest and PDF base path can be overridden from the development reader URL:
+Use a separate local manifest for private test corpora. The manifest and PDF base path can be overridden from the development reader URL:
 
 ```text
 http://localhost:8787/dev/?manifest=../bt-drucksachen/manifest.js&base=../bt-drucksachen
