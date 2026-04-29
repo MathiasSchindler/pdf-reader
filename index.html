@@ -581,6 +581,8 @@
     .s-num { display: flex; align-items: baseline; gap: 12px; }
     .s-num .n { display: inline; font-size: 28px; margin: 0; }
     .lede { grid-template-columns: 1fr; gap: 18px; }
+    .demo-stage { padding: 14px; }
+    .demo-canvas-wrap { margin: 4px auto; }
     .scope, .demo-links, footer.colophon { grid-template-columns: 1fr; }
     .demo-links a, .actions a { border-right: 0; border-bottom: 1px solid var(--rule-strong); }
     .demo-links a:last-child, .actions a:last-child { border-bottom: 0; }
@@ -924,11 +926,12 @@
   previousButton.addEventListener("click", () => renderShowcase(pageIndex - 1));
   nextButton.addEventListener("click", () => renderShowcase(pageIndex + 1));
   stage.addEventListener("wheel", (event) => {
-    if (!pdf || Math.abs(event.deltaY) < 8) return;
-    const direction = event.deltaY > 0 ? 1 : -1;
+    const normalizedDelta = normalizeWheelDelta(event);
+    if (!pdf || Math.abs(normalizedDelta) < 8) return;
+    const direction = normalizedDelta > 0 ? 1 : -1;
     if ((direction < 0 && pageIndex <= 0) || (direction > 0 && pageIndex >= pdf.pages.length - 1)) return;
     event.preventDefault();
-    wheelDelta += event.deltaY;
+    wheelDelta += normalizedDelta;
     scheduleWheelNavigation();
   }, { passive: false });
 
@@ -953,7 +956,11 @@
     status.classList.remove("error");
     const availableWidth = Math.max(260, stage.clientWidth - 24);
     const pageWidth = pageDisplayWidth(pdf.pages[pageIndex]);
-    const scale = Math.min(1.4, Math.max(0.2, availableWidth / pageWidth));
+    const pageHeight = pageDisplayHeight(pdf.pages[pageIndex]);
+    const compactViewport = window.innerWidth < 860 || window.innerHeight < 760;
+    const availableHeight = compactViewport ? Math.max(300, window.innerHeight * 0.68) : Number.POSITIVE_INFINITY;
+    const maxScale = compactViewport ? 1.05 : 1.3;
+    const scale = Math.max(0.2, Math.min(maxScale, availableWidth / pageWidth, availableHeight / pageHeight));
     try {
       await pdf.renderPage(pageIndex, canvas, { scale });
       status.textContent = `${pdf.pages.length} pages · rendered with pdf-crumb.js`;
@@ -979,6 +986,16 @@
     renderShowcase(pageIndex + direction * pageSteps);
   }
 
+  function normalizeWheelDelta(event) {
+    if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+      return event.deltaY * 16;
+    }
+    if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+      return event.deltaY * Math.max(window.innerHeight, 1);
+    }
+    return event.deltaY;
+  }
+
   function updateShowcaseControls() {
     const pageTotal = pdf?.pages.length || 0;
     pageCount.textContent = pageTotal ? `Page ${pageIndex + 1} / ${pageTotal}` : "— / —";
@@ -992,6 +1009,14 @@
     const height = Math.abs(box[3] - box[1]);
     const rotation = ((page?.rotate || 0) % 360 + 360) % 360;
     return rotation === 90 || rotation === 270 ? height : width;
+  }
+
+  function pageDisplayHeight(page) {
+    const box = page?.cropBox || page?.mediaBox || [0, 0, 612, 792];
+    const width = Math.abs(box[2] - box[0]);
+    const height = Math.abs(box[3] - box[1]);
+    const rotation = ((page?.rotate || 0) % 360 + 360) % 360;
+    return rotation === 90 || rotation === 270 ? width : height;
   }
 </script>
 
