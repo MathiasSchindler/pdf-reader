@@ -1,403 +1,1070 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>pdf-crumb.js</title>
-  <style>
-    :root {
-      color-scheme: light;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #f5f7f4;
-      color: #20201d;
-    }
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pdf-crumb.js — a small experimental PDF renderer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper:        #f6f3ec;
+    --paper-2:      #efeae0;
+    --rule:         #d8cfbf;
+    --rule-strong:  #2a2722;
+    --ink:          #1a1814;
+    --ink-2:        #3b362d;
+    --muted:        #6c6557;
+    --muted-2:      #8a8474;
+    --accent:       #1f4d3a;
+    --accent-soft:  #2f6b51;
+    --warn-ink:     #7a3a1c;
+    --warn-bg:      #f5e7d6;
+    --warn-rule:    #c9a37a;
 
-    * {
-      box-sizing: border-box;
-    }
+    --serif: "Source Serif 4", "Iowan Old Style", "Georgia", serif;
+    --sans:  "Inter", ui-sans-serif, -apple-system, "Segoe UI", sans-serif;
+    --mono:  "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      grid-template-columns: minmax(0, 1fr);
-      grid-template-rows: auto 1fr auto;
-    }
+    --pad:    24px;
+    --colw:   1080px;
+    --gut:    40px;
+  }
 
-    header,
-    main,
-    footer {
-      width: min(100%, 980px);
-      margin: 0 auto;
-      padding: 24px;
-    }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  html { color-scheme: light; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
 
-    header {
-      padding-top: 44px;
-    }
+  /* —— page frame ———————————————————————————————————— */
+  .page {
+    max-width: var(--colw);
+    margin: 0 auto;
+    padding: 32px var(--pad) 96px;
+  }
 
-    .eyebrow {
-      margin: 0 0 8px;
-      color: #5c6459;
-      font-size: 14px;
-      font-weight: 650;
-      letter-spacing: 0;
-      text-transform: uppercase;
-    }
+  /* —— top meta strip ————————————————————————————————— */
+  .meta {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: 16px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--rule);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .meta .l { text-align: left; }
+  .meta .c { text-align: center; }
+  .meta .r { text-align: right; }
+  .meta .dot { color: var(--accent); }
 
-    h1 {
-      margin: 0;
-      font-size: clamp(38px, 8vw, 76px);
-      line-height: 0.95;
-      letter-spacing: 0;
-    }
+  /* —— masthead ————————————————————————————————————— */
+  .masthead {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 20px;
+    padding: 36px 0 28px;
+    border-bottom: 2px solid var(--rule-strong);
+  }
+  .eyebrow {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .eyebrow .accent { color: var(--accent); }
 
-    .intro {
-      max-width: 720px;
-      margin: 22px 0 0;
-      font-size: 19px;
-      line-height: 1.55;
-      color: #343d35;
-    }
+  h1.wordmark {
+    margin: 6px 0 0;
+    font-family: var(--serif);
+    font-weight: 600;
+    font-size: clamp(56px, 11vw, 132px);
+    line-height: 0.92;
+    letter-spacing: -0.02em;
+    color: var(--ink);
+  }
+  h1.wordmark .dot {
+    color: var(--accent);
+    font-style: italic;
+    font-weight: 400;
+  }
+  h1.wordmark .ext {
+    font-style: italic;
+    font-weight: 400;
+    color: var(--ink-2);
+  }
 
-    .actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 26px;
-    }
+  .lede {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--gut);
+    align-items: end;
+    padding-top: 18px;
+  }
+  .lede p {
+    margin: 0;
+    font-family: var(--serif);
+    font-size: 21px;
+    line-height: 1.45;
+    color: var(--ink-2);
+    text-wrap: pretty;
+  }
+  .lede .small {
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.55;
+    color: var(--muted);
+  }
 
-    a.button {
-      display: inline-flex;
-      align-items: center;
-      min-height: 40px;
-      padding: 0 14px;
-      border: 1px solid #a8b0a5;
-      border-radius: 7px;
-      background: #ffffff;
-      color: #20201d;
-      font-weight: 650;
-      text-decoration: none;
-    }
+  /* —— action row ————————————————————————————————— */
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0;
+    margin-top: 26px;
+    border: 1px solid var(--rule-strong);
+    border-radius: 0;
+    overflow: hidden;
+    background: var(--paper-2);
+  }
+  .actions a {
+    flex: 1 1 auto;
+    min-width: 140px;
+    padding: 14px 18px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--ink);
+    text-decoration: none;
+    border-right: 1px solid var(--rule-strong);
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    transition: background 80ms ease;
+  }
+  .actions a:last-child { border-right: 0; }
+  .actions a:hover { background: var(--paper); }
+  .actions a.primary {
+    background: var(--ink);
+    color: var(--paper);
+  }
+  .actions a.primary:hover { background: var(--accent); }
+  .actions a .arrow {
+    font-family: var(--serif);
+    font-size: 16px;
+    transform: translateY(1px);
+    opacity: 0.8;
+  }
 
-    a.button.primary {
-      border-color: #1f4d3a;
-      background: #1f4d3a;
-      color: #ffffff;
-    }
+  /* —— honesty banner (loud-mode escalates) ———————————— */
+  .honesty {
+    margin-top: 24px;
+    padding: 14px 18px;
+    border: 1px solid var(--rule);
+    background: var(--paper-2);
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 14px;
+    align-items: start;
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
+  }
+  .honesty .tag {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--accent);
+    padding-top: 1px;
+    white-space: nowrap;
+  }
+  body[data-honesty="loud"] .honesty {
+    background: var(--warn-bg);
+    border-color: var(--warn-rule);
+    color: var(--warn-ink);
+  }
+  body[data-honesty="loud"] .honesty .tag { color: var(--warn-ink); }
 
-    main {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr);
-      gap: 22px;
-      align-content: start;
-    }
+  /* —— section grid ————————————————————————————————— */
+  main { padding-top: 56px; }
 
-    section {
-      border-top: 1px solid #d5ddd2;
-      padding-top: 20px;
-    }
+  section.s {
+    display: grid;
+    grid-template-columns: 200px 1fr;
+    gap: var(--gut);
+    padding: 36px 0;
+    border-top: 1px solid var(--rule);
+  }
+  section.s:first-of-type { border-top: 0; padding-top: 12px; }
 
-    h2 {
-      margin: 0 0 10px;
-      font-size: 20px;
-    }
+  .s-num {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    line-height: 1.5;
+  }
+  .s-num .n {
+    display: block;
+    font-family: var(--serif);
+    font-size: 38px;
+    color: var(--ink);
+    line-height: 1;
+    margin-bottom: 4px;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+  }
 
-    p,
-    li {
-      font-size: 16px;
-      line-height: 1.55;
-    }
+  h2 {
+    margin: 0 0 14px;
+    font-family: var(--serif);
+    font-weight: 600;
+    font-size: 30px;
+    line-height: 1.1;
+    letter-spacing: -0.01em;
+    color: var(--ink);
+  }
+  h3 {
+    margin: 0 0 8px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+  }
 
-    ul {
-      margin: 0;
-      padding-left: 20px;
-    }
+  p { margin: 0 0 12px; max-width: 64ch; text-wrap: pretty; }
+  p:last-child { margin-bottom: 0; }
 
-    code,
-    pre {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    }
+  a { color: var(--accent); text-underline-offset: 3px; }
 
-    pre {
-      overflow: auto;
-      margin: 12px 0 0;
-      padding: 14px;
-      border-radius: 7px;
-      background: #ffffff;
-      border: 1px solid #dbe2d8;
-      font-size: 14px;
-    }
+  /* —— live render ————————————————————————————————— */
+  .demo {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+  .demo-stage {
+    position: relative;
+    background: var(--paper-2);
+    border: 1px solid var(--rule);
+    padding: 18px;
+    overflow: hidden;
+  }
+  .demo-stage::before,
+  .demo-stage::after {
+    content: "";
+    position: absolute;
+    left: 0; right: 0;
+    height: 6px;
+    background-image: repeating-linear-gradient(
+      90deg, var(--rule) 0 8px, transparent 8px 16px
+    );
+    opacity: 0.5;
+  }
+  .demo-stage::before { top: 0; }
+  .demo-stage::after { bottom: 0; }
 
-    .showcase {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(280px, 0.9fr);
-      gap: 22px;
-      align-items: start;
-    }
+  .demo-canvas-wrap {
+    position: relative;
+    display: block;
+    background: #fff;
+    margin: 8px auto;
+    max-width: 100%;
+    box-shadow: 0 1px 0 rgba(0,0,0,0.04), 0 22px 40px -22px rgba(20,16,8,0.35);
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
+  #showcase-canvas {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    background: #fff;
+  }
 
-    .showcase-copy p {
-      margin: 0;
-      color: #343d35;
-    }
+  .demo-bar {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: 12px;
+    padding-top: 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .demo-bar .status {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .demo-bar .status.error { color: #9b1c1c; }
+  .demo-bar .nav {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    justify-self: center;
+  }
+  .demo-bar .nav button {
+    appearance: none;
+    border: 1px solid var(--rule-strong);
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 14px;
+    width: 30px;
+    height: 30px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0;
+  }
+  .demo-bar .nav button:hover { background: var(--paper-2); }
+  .demo-bar .nav button:disabled { color: var(--muted-2); cursor: default; opacity: 0.55; }
+  .demo-bar .pgs { min-width: 110px; text-align: center; }
+  .demo-bar .right { justify-self: end; }
 
-    .showcase-copy p + p {
-      margin-top: 12px;
-    }
+  .credit {
+    margin-top: 6px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+  }
+  .credit a { color: var(--muted); text-decoration: underline; }
 
-    .showcase-stage {
-      min-width: 0;
-      overflow: auto;
-      overscroll-behavior: contain;
-      padding: 12px;
-      border: 1px solid #d5ddd2;
-      border-radius: 8px;
-      background: #ffffff;
-    }
+  /* —— code blocks ————————————————————————————————— */
+  pre {
+    margin: 12px 0 0;
+    padding: 16px 18px;
+    background: #1c1a16;
+    color: #e8e3d6;
+    border: 1px solid var(--rule-strong);
+    border-radius: 0;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.55;
+    overflow-x: auto;
+  }
+  pre .c { color: #8a8474; font-style: italic; }
+  pre .k { color: #e0c486; }
+  pre .s { color: #a8c79a; }
+  pre .t { color: #c9b8d6; }
+  pre .p { color: #c4b8a4; }
+  code {
+    font-family: var(--mono);
+    font-size: 0.92em;
+    background: var(--paper-2);
+    padding: 1px 5px;
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+  }
+  pre code { background: none; padding: 0; border: 0; font-size: inherit; }
 
-    .showcase-stage canvas {
-      display: block;
-      width: 100%;
-      max-width: 100%;
-      height: auto;
-      margin: 0 auto;
-      background: #ffffff;
-      box-shadow: 0 2px 18px rgba(22, 34, 24, 0.16);
-    }
+  /* —— builds table ————————————————————————————————— */
+  .builds {
+    margin-top: 4px;
+    border: 1px solid var(--rule-strong);
+  }
+  .builds .row {
+    display: grid;
+    grid-template-columns: 110px 1fr;
+    gap: 0;
+    border-bottom: 1px solid var(--rule);
+    align-items: stretch;
+  }
+  .builds .row:last-child { border-bottom: 0; }
+  .builds .name {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink);
+    background: var(--paper-2);
+    padding: 14px 16px;
+    border-right: 1px solid var(--rule);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .builds .name .pill {
+    font-size: 10.5px;
+    font-weight: 500;
+    color: var(--accent);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+  .builds .desc {
+    padding: 14px 16px;
+    font-size: 14.5px;
+    line-height: 1.5;
+  }
+  .builds .desc .file {
+    display: block;
+    margin-top: 6px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
 
-    .showcase-controls {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 10px;
-      margin-top: 12px;
-    }
+  /* —— scope (works/gaps) two-column —————————————— */
+  .scope {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--gut);
+  }
+  .scope h3 {
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .scope h3 .swatch {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-right: 8px;
+    transform: translateY(-1px);
+    background: var(--accent);
+  }
+  .scope.gaps h3 .swatch { background: var(--warn-rule); }
 
-    .showcase-controls button {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 36px;
-      height: 36px;
-      border: 1px solid #a8b0a5;
-      border-radius: 999px;
-      background: #ffffff;
-      color: #1f4d3a;
-      font: inherit;
-      font-size: 20px;
-      line-height: 1;
-      cursor: pointer;
-    }
+  ul.list {
+    margin: 10px 0 0;
+    padding: 0;
+    list-style: none;
+  }
+  ul.list li {
+    position: relative;
+    padding: 8px 0 8px 22px;
+    font-size: 14.5px;
+    line-height: 1.45;
+    border-bottom: 1px dashed var(--rule);
+  }
+  ul.list li:last-child { border-bottom: 0; }
+  ul.list li::before {
+    content: "+";
+    position: absolute;
+    left: 0;
+    top: 8px;
+    font-family: var(--mono);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .scope.gaps ul.list li::before {
+    content: "−";
+    color: var(--warn-rule);
+  }
 
-    .showcase-controls button:disabled {
-      color: #a0a79d;
-      cursor: default;
-      opacity: 0.55;
-    }
+  /* —— security key/value ———————————————————————— */
+  .kv {
+    display: grid;
+    grid-template-columns: 180px 1fr;
+    gap: 0;
+    border-top: 1px solid var(--rule);
+    margin-top: 16px;
+  }
+  .kv > div {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--rule);
+    font-size: 14.5px;
+    line-height: 1.5;
+  }
+  .kv .k {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    padding-top: 14px;
+  }
 
-    .showcase-page-count {
-      min-width: 76px;
-      color: #343d35;
-      font-size: 14px;
-      font-variant-numeric: tabular-nums;
-      text-align: center;
-    }
+  /* —— links cards ————————————————————————————————— */
+  .demo-links {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 0;
+    border: 1px solid var(--rule-strong);
+  }
+  .demo-links a {
+    display: block;
+    padding: 18px 18px 20px;
+    text-decoration: none;
+    color: var(--ink);
+    border-right: 1px solid var(--rule-strong);
+    background: var(--paper-2);
+    transition: background 80ms ease;
+  }
+  .demo-links a:last-child { border-right: 0; }
+  .demo-links a:hover { background: var(--paper); }
+  .demo-links .label {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+  }
+  .demo-links .title {
+    font-family: var(--serif);
+    font-size: 22px;
+    font-weight: 600;
+    margin: 6px 0 6px;
+    line-height: 1.1;
+    letter-spacing: -0.01em;
+  }
+  .demo-links p {
+    margin: 0;
+    font-size: 13.5px;
+    color: var(--ink-2);
+    line-height: 1.45;
+  }
+  .demo-links .path {
+    display: block;
+    margin-top: 10px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+  }
 
-    .showcase-status {
-      margin: 10px 0 0;
-      color: #5c6459;
-      font-size: 14px;
-      line-height: 1.45;
-    }
+  /* —— colophon / footer ————————————————————————— */
+  footer.colophon {
+    margin-top: 80px;
+    padding-top: 28px;
+    border-top: 2px solid var(--rule-strong);
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--gut);
+    font-size: 13.5px;
+    line-height: 1.55;
+    color: var(--ink-2);
+  }
+  footer.colophon h3 { margin-bottom: 10px; }
+  footer.colophon p { margin: 0 0 10px; }
+  footer.colophon .signoff {
+    grid-column: 1 / -1;
+    margin-top: 24px;
+    padding-top: 18px;
+    border-top: 1px solid var(--rule);
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
 
-    .showcase-status.error {
-      color: #9b1c1c;
-    }
+  /* —— responsive ————————————————————————————————— */
+  @media (max-width: 820px) {
+    section.s { grid-template-columns: 1fr; gap: 14px; padding: 28px 0; }
+    .s-num { display: flex; align-items: baseline; gap: 12px; }
+    .s-num .n { display: inline; font-size: 28px; margin: 0; }
+    .lede { grid-template-columns: 1fr; gap: 18px; }
+    .scope, .demo-links, footer.colophon { grid-template-columns: 1fr; }
+    .demo-links a, .actions a { border-right: 0; border-bottom: 1px solid var(--rule-strong); }
+    .demo-links a:last-child, .actions a:last-child { border-bottom: 0; }
+    .builds .row { grid-template-columns: 1fr; }
+    .builds .name { border-right: 0; border-bottom: 1px solid var(--rule); }
+    .kv { grid-template-columns: 1fr; }
+    .kv .k { padding-top: 12px; padding-bottom: 0; border-bottom: 0; }
+  }
 
-    .showcase-credit {
-      margin: 8px 0 0;
-      color: #5c6459;
-      font-size: 13px;
-      line-height: 1.45;
-    }
+  /* —— density tweak ————————————————————————————— */
+  body[data-density="compact"] section.s { padding: 26px 0; }
+  body[data-density="compact"] h2 { font-size: 26px; }
+  body[data-density="compact"] p { font-size: 15px; }
+  body[data-density="comfy"]   section.s { padding: 48px 0; }
+  body[data-density="comfy"]   h2 { font-size: 34px; }
 
-    .showcase-credit a {
-      color: #1f4d3a;
-    }
-
-    @media (max-width: 760px) {
-      .showcase {
-        grid-template-columns: 1fr;
-      }
-    }
-
-    footer {
-      color: #5c6459;
-      font-size: 14px;
-    }
-  </style>
+  /* —— headline tweak ————————————————————————————— */
+  body[data-headline="mono"] h1.wordmark {
+    font-family: var(--mono);
+    font-weight: 600;
+    letter-spacing: -0.04em;
+    font-size: clamp(44px, 8.5vw, 100px);
+  }
+  body[data-headline="mono"] h1.wordmark .dot { font-style: normal; }
+  body[data-headline="mono"] h1.wordmark .ext { font-style: normal; }
+</style>
 </head>
-<body>
-  <header>
-    <p class="eyebrow">dependency-free browser PDF rendering</p>
-    <h1>pdf-crumb.js</h1>
-    <p class="intro">A small experimental PDF renderer for the browser. It parses PDF objects and content streams directly, paints pages to canvas, and ships as a single minified JavaScript file for simple embedding.</p>
-    <nav class="actions" aria-label="Project links">
-      <a class="button primary" href="./dist/demo/">Open Demo</a>
-      <a class="button" href="./dist/pdf-crumb-dist.zip" download>Download</a>
-      <a class="button" href="./dev/">Development Reader</a>
-      <a class="button" href="https://creativecommons.org/publicdomain/zero/1.0/">CC0 License</a>
+<body data-honesty="quiet" data-density="regular" data-headline="serif">
+
+<div class="page">
+
+  <!-- ─── meta strip ─────────────────────────────────────── -->
+  <div class="meta">
+    <span class="l">v0.1.0 · experimental</span>
+    <span class="c"><span class="dot">●</span> CC0-1.0 · Public Domain</span>
+    <span class="r">No. 001 · 2026</span>
+  </div>
+
+  <!-- ─── masthead ───────────────────────────────────────── -->
+  <header class="masthead">
+    <p class="eyebrow">A dependency-free PDF renderer for the browser <span class="accent">— field notes</span></p>
+    <h1 class="wordmark">pdf-crumb<span class="ext">.js</span></h1>
+    <div class="lede">
+      <p>A small experimental PDF renderer that parses objects and content streams directly and paints pages to canvas. It ships as a single minified file, has no runtime dependencies, and is feature-incomplete on purpose.</p>
+      <p class="small">It is <em>not</em> a replacement for PDF.js. The renderer covers a useful subset of text, paths, fonts, and images — enough to display many real documents — and is honest about what it skips. Built as a learning code base and a development playground, with substantial LLM assistance under human review.</p>
+    </div>
+
+    <nav class="actions" aria-label="Project actions">
+      <a class="primary" href="./dist/demo/">Open demo <span class="arrow">→</span></a>
+      <a href="./dev/">Dev reader <span class="arrow">→</span></a>
+      <a href="./dist/pdf-crumb-dist.zip" download>Download <span class="arrow">↓</span></a>
+      <a href="https://creativecommons.org/publicdomain/zero/1.0/">CC0 license <span class="arrow">→</span></a>
     </nav>
+
+    <aside class="honesty" id="honesty-banner">
+      <span class="tag">Read first</span>
+      <span id="honesty-text">This is an experiment, not a conformance-grade PDF implementation. Treat its output as an approximate rendering, not archival or legally reliable PDF reproduction. For untrusted documents at scale, use PDF.js.</span>
+    </aside>
   </header>
 
   <main>
-    <section class="showcase" aria-labelledby="showcase-title">
-      <div class="showcase-copy">
-        <h2 id="showcase-title">Live Render</h2>
-        <p>This page uses <code>dist/pdf-crumb.viewer.min.js</code> to render the first page of <code>pdf-files/PDF.pdf</code>, a freely licensed Wikipedia article export included with the repository.</p>
-        <p>The canvas below is produced by pdf-crumb.js directly in the browser, without PDF.js as a fallback.</p>
-      </div>
-      <div class="showcase-stage" id="showcase-stage">
-        <canvas id="showcase-canvas" aria-label="Rendered first page of the PDF article"></canvas>
-        <div class="showcase-controls" aria-label="PDF page controls">
-          <button id="showcase-previous" type="button" aria-label="Previous page">&larr;</button>
-          <span class="showcase-page-count" id="showcase-page-count">Page - / -</span>
-          <button id="showcase-next" type="button" aria-label="Next page">&rarr;</button>
+
+    <!-- ─── 01 live render ─────────────────────────────────── -->
+    <section class="s" id="live">
+      <div class="s-num"><span class="n">01</span> Live render</div>
+      <div>
+        <h2>Rendered by pdf-crumb.js, in this page.</h2>
+        <p>The canvas below is produced by <code>dist/pdf-crumb.viewer.min.js</code> running in your browser. No PDF.js fallback. Use the arrows or scroll-wheel to page through.</p>
+
+        <div class="demo">
+          <div class="demo-stage">
+            <div class="demo-canvas-wrap" id="showcase-stage">
+              <canvas id="showcase-canvas" aria-label="First page of the source PDF, rendered by pdf-crumb.js"></canvas>
+            </div>
+            <div class="demo-bar">
+              <span class="status" id="showcase-status">Loading sample document…</span>
+              <div class="nav" aria-label="Page controls">
+                <button id="showcase-previous" type="button" aria-label="Previous page">‹</button>
+                <span class="pgs" id="showcase-page-count">— / —</span>
+                <button id="showcase-next" type="button" aria-label="Next page">›</button>
+              </div>
+              <span class="right">pdf-files/PDF.pdf</span>
+            </div>
+          </div>
+          <p class="credit">Source document: English Wikipedia article <a href="https://en.wikipedia.org/wiki/PDF">“PDF”</a>. See its history for authors and CC&nbsp;BY-SA terms.</p>
         </div>
-        <p class="showcase-status" id="showcase-status">Loading PDF showcase...</p>
-        <p class="showcase-credit">Source document: English Wikipedia article <a href="https://en.wikipedia.org/wiki/PDF">"PDF"</a>. See the article history for authors and CC BY-SA license terms.</p>
       </div>
     </section>
 
-    <section>
-      <h2>Use It</h2>
-      <p>The normal embeddable file is <code>dist/pdf-crumb.viewer.min.js</code>. It keeps stable rendering features, including image XObjects and browser-loaded embedded CFF fonts, while leaving diagnostics out.</p>
-      <pre><code>&lt;canvas id="page"&gt;&lt;/canvas&gt;
-&lt;script type="module"&gt;
-  import { loadPdfCrumb } from "./dist/pdf-crumb.viewer.min.js";
+    <!-- ─── 02 why / when ─────────────────────────────────── -->
+    <section class="s" id="why">
+      <div class="s-num"><span class="n">02</span> Why &amp; when</div>
+      <div>
+        <h2>Useful when small and approximate beats large and exact.</h2>
 
-  const pdf = await loadPdfCrumb("./example.pdf");
-  await pdf.renderPage(0, document.getElementById("page"), { scale: 1.5 });
-&lt;/script&gt;</code></pre>
+        <div class="scope" style="grid-template-columns: 1fr 1fr;">
+          <div>
+            <h3>Reach for it when</h3>
+            <ul class="list">
+              <li>You want to display mostly-text PDFs on a small page without pulling in a multi-megabyte renderer.</li>
+              <li>You want a single script tag that renders a known-good document.</li>
+              <li>You want to read a renderer end-to-end to learn how PDFs work.</li>
+              <li>You need a development playground for parser and rendering experiments.</li>
+            </ul>
+          </div>
+          <div class="gaps">
+            <h3>Don't reach for it when</h3>
+            <ul class="list">
+              <li>You need to render arbitrary, untrusted, third-party PDFs at production scale.</li>
+              <li>You need exact, legally reliable reproduction (use PDF.js or a server-side renderer).</li>
+              <li>You depend on JPEG 2000, complex masking, transparency groups, or full font shaping.</li>
+              <li>You need form fields, JavaScript, annotations, or interactive features.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
     </section>
 
-    <section>
-      <h2>Builds</h2>
-      <ul>
-        <li><code>full</code>: development build with audit output and experimental embedded outline rendering.</li>
-        <li><code>viewer</code>: default third-party build for general PDF display.</li>
-        <li><code>text</code>: smallest profile for text/vector-only PDFs; image XObjects are disabled.</li>
-      </ul>
+    <!-- ─── 03 use ────────────────────────────────────────── -->
+    <section class="s" id="use">
+      <div class="s-num"><span class="n">03</span> Use it</div>
+      <div>
+        <h2>One canvas, one script tag.</h2>
+        <p>The default embeddable file is <code>dist/pdf-crumb.viewer.min.js</code>. It keeps stable rendering features — image XObjects, browser-loaded embedded CFF fonts — and leaves diagnostics out.</p>
+
+        <h3 style="margin-top:18px;">As an ES module</h3>
+<pre><code><span class="t">&lt;canvas</span> <span class="k">id</span>=<span class="s">"page"</span><span class="t">&gt;&lt;/canvas&gt;</span>
+<span class="t">&lt;script</span> <span class="k">type</span>=<span class="s">"module"</span><span class="t">&gt;</span>
+  <span class="k">import</span> { loadPdfCrumb } <span class="k">from</span> <span class="s">"./dist/pdf-crumb.viewer.min.js"</span>;
+
+  <span class="k">const</span> pdf = <span class="k">await</span> loadPdfCrumb(<span class="s">"./example.pdf"</span>);
+  <span class="k">await</span> pdf.renderPage(<span class="p">0</span>, document.getElementById(<span class="s">"page"</span>), { scale: <span class="p">1.5</span> });
+<span class="t">&lt;/script&gt;</span></code></pre>
+
+        <h3 style="margin-top:22px;">As a plain script tag</h3>
+<pre><code><span class="t">&lt;canvas</span> <span class="k">id</span>=<span class="s">"page"</span><span class="t">&gt;&lt;/canvas&gt;</span>
+<span class="t">&lt;script</span> <span class="k">src</span>=<span class="s">"./dist/pdf-crumb.viewer.global.min.js"</span><span class="t">&gt;&lt;/script&gt;</span>
+<span class="t">&lt;script&gt;</span>
+  (<span class="k">async</span> () =&gt; {
+    <span class="k">const</span> pdf = <span class="k">await</span> PdfCrumb.load(<span class="s">"./example.pdf"</span>);
+    <span class="k">await</span> pdf.renderPage(<span class="p">0</span>, document.getElementById(<span class="s">"page"</span>), { scale: <span class="p">1.5</span> });
+  })();
+<span class="t">&lt;/script&gt;</span></code></pre>
+      </div>
     </section>
 
-    <section>
-      <h2>Open Source</h2>
-      <p>The project is released under CC0-1.0. The code base was written with substantial LLM assistance, mostly GPT-5.5, with human direction, testing, and review throughout.</p>
+    <!-- ─── 04 builds ─────────────────────────────────────── -->
+    <section class="s" id="builds">
+      <div class="s-num"><span class="n">04</span> Builds</div>
+      <div>
+        <h2>Three profiles. Pick the one whose features you actually need.</h2>
+        <p>The build emits each profile as one minified JavaScript file in two flavours — an ESM module and a script-tag global.</p>
+
+        <div class="builds">
+          <div class="row">
+            <div class="name">viewer<span class="pill">default</span></div>
+            <div class="desc">
+              Stable rendering for general PDF display. Image XObjects, browser-loaded embedded CFF fonts, no diagnostics. The right choice for embedding on a third-party page.
+              <span class="file">dist/pdf-crumb.viewer.min.js · .global.min.js</span>
+            </div>
+          </div>
+          <div class="row">
+            <div class="name">text<span class="pill">smallest</span></div>
+            <div class="desc">
+              Smallest profile, for text- and vector-only PDFs. Image XObjects are disabled. Use it when you control the input and know it has no rasters.
+              <span class="file">dist/pdf-crumb.text.min.js · .global.min.js</span>
+            </div>
+          </div>
+          <div class="row">
+            <div class="name">full<span class="pill">development</span></div>
+            <div class="desc">
+              Development build with audit data and experimental embedded outline rendering. Used by the local dev reader and comparison tools; not intended for production embedding.
+              <span class="file">dist/pdf-crumb.min.js · .global.min.js</span>
+            </div>
+          </div>
+        </div>
+      </div>
     </section>
+
+    <!-- ─── 05 scope ──────────────────────────────────────── -->
+    <section class="s" id="scope">
+      <div class="s-num"><span class="n">05</span> Scope</div>
+      <div>
+        <h2>What it does. What it doesn't.</h2>
+        <p>The renderer covers a usefully wide subset of PDF — enough to display many real documents — and stops short of the long tail. The list below is the same one in the README, kept in plain sight on purpose.</p>
+
+        <div class="scope" style="margin-top:18px;">
+          <div>
+            <h3><span class="swatch"></span>Currently useful</h3>
+            <ul class="list">
+              <li>Direct PDF object parsing and page-tree walking with inherited boxes and rotation.</li>
+              <li>Flate, ASCIIHex, ASCII85, and RunLength stream decoding.</li>
+              <li>Page content stream concatenation and a subset of the operator set.</li>
+              <li>Basic <code>ToUnicode</code> CMap reading.</li>
+              <li>Width tables for simple fonts and Type0/CID descendant fonts.</li>
+              <li>Browser-loaded wrapped Type1C/CFF embedded fonts when accepted by <code>FontFace</code>.</li>
+              <li>Direct outline rendering for safe simple TrueType subsets.</li>
+              <li>Subset of text, path, clipping, form XObject, color, graphics-state, and image XObject operators.</li>
+              <li>JPEG image XObjects via browser image decoding.</li>
+              <li>Raw image XObjects for gray, RGB, ICC-like, CMYK-like, and Indexed data.</li>
+            </ul>
+          </div>
+          <div class="gaps">
+            <h3><span class="swatch"></span>Known gaps</h3>
+            <ul class="list">
+              <li>Full PDF font shaping and all font program formats.</li>
+              <li>JPX / JPEG 2000 and complex masked image XObjects.</li>
+              <li>Full external graphics-state handling.</li>
+              <li>Text clipping modes.</li>
+              <li>Calibrated, ICC, indexed, separation, and pattern color spaces beyond the implemented subset.</li>
+              <li>Advanced clipping interactions and transparency groups.</li>
+              <li>Less common stream filters beyond Flate, ASCIIHex, ASCII85, and RunLength.</li>
+              <li>Annotations, forms, JavaScript, embedded files, and other active content.</li>
+            </ul>
+          </div>
+        </div>
+
+        <p style="margin-top:18px; color:var(--muted-2); font-size:14px;">If a document doesn't render correctly, that's expected before it's surprising. Open a minimized fixture and check the dev reader's PDF.js comparison view.</p>
+      </div>
+    </section>
+
+    <!-- ─── 06 security ───────────────────────────────────── -->
+    <section class="s" id="security">
+      <div class="s-num"><span class="n">06</span> Security</div>
+      <div>
+        <h2>Bounded by default. Not battle-tested.</h2>
+        <p>The renderer doesn't execute PDF JavaScript, launch files, submit forms, or follow remote actions. Active-content markers (<code>/OpenAction</code>, <code>/JavaScript</code>, <code>/Launch</code>, <code>/SubmitForm</code>, <code>/URI</code>, <code>/EmbeddedFile</code>, <code>/RichMedia</code>, <code>/XFA</code>, …) are reported through <code>pdf.audit().activeContent</code> when diagnostics are on, but never acted on.</p>
+
+        <div class="kv">
+          <div class="k">Active content</div>
+          <div>Ignored. Markers are surfaced via <code>pdf.audit()</code>, not executed.</div>
+          <div class="k">Resource limits</div>
+          <div>Defaults bound input size, decoded stream bytes, page count, page-tree depth, content operators, graphics stack, form XObject recursion, image dimensions and pixels, embedded font bytes, CMap entries, and object-stream expansion. Tighten via <code>limits</code>.</div>
+          <div class="k">Cancellation</div>
+          <div>Pass an <code>AbortSignal</code> to <code>loadPdfCrumb</code> and to <code>renderPage</code> options to cancel parse, fetch, and render work.</div>
+          <div class="k">Recommended</div>
+          <div>Run parsing and rendering in a dedicated Worker for untrusted inputs. The in-process limits are still required; the worker is an additional containment layer, not a replacement.</div>
+          <div class="k">Testing</div>
+          <div>Local fuzzing harnesses mutate fixture PDFs and feed them to the parser and renderer, with a PDF.js oracle and a deterministic <code>npm run test:security</code> suite. Findings are local robustness bugs until investigated, not exploit reports.</div>
+          <div class="k">Status</div>
+          <div>Basic security testing only. Treat the renderer as untested for adversarial production loads.</div>
+        </div>
+
+        <h3 style="margin-top:22px;">Constraining a load</h3>
+<pre><code><span class="k">import</span> { loadPdfCrumb } <span class="k">from</span> <span class="s">"./dist/pdf-crumb.viewer.min.js"</span>;
+
+<span class="k">const</span> controller = <span class="k">new</span> AbortController();
+<span class="k">const</span> pdf = <span class="k">await</span> loadPdfCrumb(url, {
+  signal: controller.signal,
+  limits: {
+    maxInputBytes:         <span class="p">32</span> * <span class="p">1024</span> * <span class="p">1024</span>,
+    maxDecodedStreamBytes: <span class="p">16</span> * <span class="p">1024</span> * <span class="p">1024</span>,
+    maxImagePixels:        <span class="p">8_000_000</span>,
+  },
+});</code></pre>
+      </div>
+    </section>
+
+    <!-- ─── 07 demos ──────────────────────────────────────── -->
+    <section class="s" id="demos">
+      <div class="s-num"><span class="n">07</span> Demos</div>
+      <div>
+        <h2>Two demo sites, different complexity.</h2>
+        <p>Both are static pages in this repository; serve the project root and open them at the paths shown. The live render at the top of this page is a third, intentionally minimal embed.</p>
+
+        <div class="demo-links">
+          <a href="./dist/demo/">
+            <span class="label">Minimal</span>
+            <span class="title">dist/demo</span>
+            <p>The smallest sensible embed. Uses the viewer bundle, the bundled sample PDF, file upload, and drag-and-drop. The example to copy if you want to drop pdf-crumb.js into a third-party page.</p>
+            <span class="path">/dist/demo/</span>
+          </a>
+          <a href="./dev/">
+            <span class="label">Development</span>
+            <span class="title">dev/</span>
+            <p>Sample selection, PDF.js comparison mode, pixel-difference view, renderer audit, and font-mode controls. Useful for development and for inspecting why a particular document doesn't render correctly.</p>
+            <span class="path">/dev/</span>
+          </a>
+          <a href="#live">
+            <span class="label">Inline</span>
+            <span class="title">This page</span>
+            <p>The render at the top of this page is a third demo: a single canvas, one script tag, no controls beyond paging. About as minimal as embedding gets.</p>
+            <span class="path">/index.html#live</span>
+          </a>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── 08 provenance ─────────────────────────────────── -->
+    <section class="s" id="provenance">
+      <div class="s-num"><span class="n">08</span> Provenance</div>
+      <div>
+        <h2>Public domain, written with LLM assistance.</h2>
+        <p>Released under <a href="https://creativecommons.org/publicdomain/zero/1.0/">CC0-1.0</a>. Use it, rewrite it, fork it, ship it — no attribution required, though a link is appreciated.</p>
+        <p>The code base was written with substantial LLM assistance, mostly GPT-5.5, with human direction, testing, and review throughout. The dev reader vendors PDF.js (Apache-2.0, © Mozilla Foundation) for the comparison view only; the original license notices are kept intact under <code>vendor/pdfjs/</code>.</p>
+        <p>The bundled sample <code>pdf-files/PDF.pdf</code> is the English Wikipedia article “PDF” exported as a PDF; see <code>THIRD_PARTY_NOTICES.md</code> for authors and CC&nbsp;BY-SA attribution.</p>
+      </div>
+    </section>
+
   </main>
 
-  <footer>
-    pdf-crumb.js is experimental software, not a conformance-grade PDF implementation.
+  <!-- ─── colophon ─────────────────────────────────────── -->
+  <footer class="colophon">
+    <div>
+      <h3>Set in</h3>
+      <p>Source Serif 4 for display, Inter for body, JetBrains Mono for code and metadata. Composed in HTML and CSS; no framework on this page.</p>
+    </div>
+    <div>
+      <h3>About these field notes</h3>
+      <p>This page is the project's front door, not its documentation. The <a href="./README.md">README</a> is the source of truth for build commands, fuzzing, and the parser's exact accept/reject policies.</p>
+    </div>
+    <div class="signoff">
+      <span>pdf-crumb.js · v0.1.0</span>
+      <span>experimental · CC0-1.0</span>
+    </div>
   </footer>
-  <script type="module">
-    import { loadPdfCrumb } from "./dist/pdf-crumb.viewer.min.js";
 
-    const canvas = document.getElementById("showcase-canvas");
-    const stage = document.getElementById("showcase-stage");
-    const status = document.getElementById("showcase-status");
-    const pageCount = document.getElementById("showcase-page-count");
-    const previousButton = document.getElementById("showcase-previous");
-    const nextButton = document.getElementById("showcase-next");
-    const wheelDeltaPerPage = 90;
-    const maxWheelPages = 5;
-    let pdf = null;
-    let pageIndex = 0;
-    let resizeTimer = 0;
-    let wheelTimer = 0;
-    let wheelDelta = 0;
-    let isRendering = false;
+</div>
 
-    previousButton.disabled = true;
-    nextButton.disabled = true;
-    previousButton.addEventListener("click", () => renderShowcase(pageIndex - 1));
-    nextButton.addEventListener("click", () => renderShowcase(pageIndex + 1));
-    stage.addEventListener("wheel", (event) => {
-      if (!pdf || Math.abs(event.deltaY) < 8) return;
-      const direction = event.deltaY > 0 ? 1 : -1;
-      if ((direction < 0 && pageIndex <= 0) || (direction > 0 && pageIndex >= pdf.pages.length - 1)) return;
-      event.preventDefault();
-      wheelDelta += event.deltaY;
-      scheduleWheelNavigation();
-    }, { passive: false });
+<!-- ─── live-render script ───────────────────────────────── -->
+<script type="module">
+  import { loadPdfCrumb } from "./dist/pdf-crumb.viewer.min.js";
 
+  const canvas = document.getElementById("showcase-canvas");
+  const stage  = document.getElementById("showcase-stage");
+  const status = document.getElementById("showcase-status");
+  const pageCount = document.getElementById("showcase-page-count");
+  const previousButton = document.getElementById("showcase-previous");
+  const nextButton = document.getElementById("showcase-next");
+  const wheelDeltaPerPage = 90;
+  const maxWheelPages = 5;
+  let pdf = null;
+  let pageIndex = 0;
+  let resizeTimer = 0;
+  let wheelTimer = 0;
+  let wheelDelta = 0;
+  let isRendering = false;
+
+  previousButton.disabled = true;
+  nextButton.disabled = true;
+  previousButton.addEventListener("click", () => renderShowcase(pageIndex - 1));
+  nextButton.addEventListener("click", () => renderShowcase(pageIndex + 1));
+  stage.addEventListener("wheel", (event) => {
+    if (!pdf || Math.abs(event.deltaY) < 8) return;
+    const direction = event.deltaY > 0 ? 1 : -1;
+    if ((direction < 0 && pageIndex <= 0) || (direction > 0 && pageIndex >= pdf.pages.length - 1)) return;
+    event.preventDefault();
+    wheelDelta += event.deltaY;
+    scheduleWheelNavigation();
+  }, { passive: false });
+
+  try {
+    pdf = await loadPdfCrumb("./pdf-files/PDF.pdf");
+    await renderShowcase();
+    window.addEventListener("resize", () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(renderShowcase, 120);
+    });
+  } catch (error) {
+    status.textContent = error.message || String(error);
+    status.classList.add("error");
+  }
+
+  async function renderShowcase(nextPageIndex = pageIndex) {
+    if (!pdf || isRendering) return;
+    pageIndex = Math.min(Math.max(nextPageIndex, 0), pdf.pages.length - 1);
+    isRendering = true;
+    updateShowcaseControls();
+    status.textContent = `Rendering page ${pageIndex + 1}…`;
+    status.classList.remove("error");
+    const availableWidth = Math.max(260, stage.clientWidth - 24);
+    const pageWidth = pageDisplayWidth(pdf.pages[pageIndex]);
+    const scale = Math.min(1.4, Math.max(0.2, availableWidth / pageWidth));
     try {
-      pdf = await loadPdfCrumb("./pdf-files/PDF.pdf");
-      await renderShowcase();
-      window.addEventListener("resize", () => {
-        clearTimeout(resizeTimer);
-        resizeTimer = setTimeout(renderShowcase, 120);
-      });
+      await pdf.renderPage(pageIndex, canvas, { scale });
+      status.textContent = `${pdf.pages.length} pages · rendered with pdf-crumb.js`;
     } catch (error) {
-      status.textContent = error.message;
+      status.textContent = error.message || String(error);
       status.classList.add("error");
     }
+    isRendering = false;
+    updateShowcaseControls();
+    if (Math.abs(wheelDelta) >= 8) scheduleWheelNavigation();
+  }
 
-    async function renderShowcase(nextPageIndex = pageIndex) {
-      if (!pdf || isRendering) return;
-      pageIndex = Math.min(Math.max(nextPageIndex, 0), pdf.pages.length - 1);
-      isRendering = true;
-      updateShowcaseControls();
-      status.textContent = `Rendering page ${pageIndex + 1}...`;
-      status.classList.remove("error");
-      const availableWidth = Math.max(260, stage.clientWidth - 24);
-      const pageWidth = pageDisplayWidth(pdf.pages[pageIndex]);
-      const scale = Math.min(1.15, Math.max(0.2, availableWidth / pageWidth));
-      try {
-        await pdf.renderPage(pageIndex, canvas, { scale });
-        status.textContent = `${pdf.pages.length} pages · rendered with pdf-crumb.js`;
-      } catch (error) {
-        status.textContent = error.message;
-        status.classList.add("error");
-      }
-      isRendering = false;
-      updateShowcaseControls();
-      if (Math.abs(wheelDelta) >= 8) {
-        scheduleWheelNavigation();
-      }
-    }
+  function scheduleWheelNavigation() {
+    if (wheelTimer) clearTimeout(wheelTimer);
+    wheelTimer = setTimeout(() => { wheelTimer = 0; consumeWheelNavigation(); }, 45);
+  }
 
-    function scheduleWheelNavigation() {
-      if (wheelTimer) {
-        clearTimeout(wheelTimer);
-      }
-      wheelTimer = setTimeout(() => {
-        wheelTimer = 0;
-        consumeWheelNavigation();
-      }, 45);
-    }
+  function consumeWheelNavigation() {
+    if (!pdf || isRendering || Math.abs(wheelDelta) < 8) return;
+    const direction = wheelDelta > 0 ? 1 : -1;
+    const pageSteps = Math.min(maxWheelPages, Math.max(1, Math.floor(Math.abs(wheelDelta) / wheelDeltaPerPage)));
+    wheelDelta = 0;
+    renderShowcase(pageIndex + direction * pageSteps);
+  }
 
-    function consumeWheelNavigation() {
-      if (!pdf || isRendering || Math.abs(wheelDelta) < 8) return;
-      const direction = wheelDelta > 0 ? 1 : -1;
-      const pageSteps = Math.min(maxWheelPages, Math.max(1, Math.floor(Math.abs(wheelDelta) / wheelDeltaPerPage)));
-      wheelDelta = 0;
-      renderShowcase(pageIndex + direction * pageSteps);
-    }
+  function updateShowcaseControls() {
+    const pageTotal = pdf?.pages.length || 0;
+    pageCount.textContent = pageTotal ? `Page ${pageIndex + 1} / ${pageTotal}` : "— / —";
+    previousButton.disabled = isRendering || !pageTotal || pageIndex <= 0;
+    nextButton.disabled = isRendering || !pageTotal || pageIndex >= pageTotal - 1;
+  }
 
-    function updateShowcaseControls() {
-      const pageTotal = pdf?.pages.length || 0;
-      pageCount.textContent = pageTotal ? `Page ${pageIndex + 1} / ${pageTotal}` : "Page - / -";
-      previousButton.disabled = isRendering || !pageTotal || pageIndex <= 0;
-      nextButton.disabled = isRendering || !pageTotal || pageIndex >= pageTotal - 1;
-    }
+  function pageDisplayWidth(page) {
+    const box = page?.cropBox || page?.mediaBox || [0, 0, 612, 792];
+    const width = Math.abs(box[2] - box[0]);
+    const height = Math.abs(box[3] - box[1]);
+    const rotation = ((page?.rotate || 0) % 360 + 360) % 360;
+    return rotation === 90 || rotation === 270 ? height : width;
+  }
+</script>
 
-    function pageDisplayWidth(page) {
-      const box = page?.cropBox || page?.mediaBox || [0, 0, 612, 792];
-      const width = Math.abs(box[2] - box[0]);
-      const height = Math.abs(box[3] - box[1]);
-      const rotation = ((page?.rotate || 0) % 360 + 360) % 360;
-      return rotation === 90 || rotation === 270 ? height : width;
-    }
-  </script>
+<!-- ─── React + Tweaks panel ─────────────────────────────── -->
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script type="text/babel" src="./tweaks-panel.jsx"></script>
+<div id="tweaks-root"></div>
+<script type="text/babel">
+  const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+    "accent": "#1f4d3a",
+    "honesty": "quiet",
+    "density": "regular",
+    "headline": "serif"
+  }/*EDITMODE-END*/;
+
+  const HONESTY_TEXT = {
+    quiet:
+      "This is an experiment, not a conformance-grade PDF implementation. Treat its output as an approximate rendering, not archival or legally reliable PDF reproduction. For untrusted documents at scale, use PDF.js.",
+    loud:
+      "This is an experiment. It is feature-incomplete on purpose, has had only basic security testing, and will mis-render documents that depend on features it doesn't implement. It is NOT a replacement for PDF.js. Use it for learning, embedding small known-good documents, or as a development playground — not for archival, legal, or untrusted-input use.",
+  };
+
+  function App() {
+    const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
+
+    React.useEffect(() => {
+      document.body.dataset.honesty  = t.honesty;
+      document.body.dataset.density  = t.density;
+      document.body.dataset.headline = t.headline;
+      document.documentElement.style.setProperty("--accent", t.accent);
+      document.documentElement.style.setProperty("--accent-soft", t.accent);
+      const honestyEl = document.getElementById("honesty-text");
+      if (honestyEl) honestyEl.textContent = HONESTY_TEXT[t.honesty] || HONESTY_TEXT.quiet;
+    }, [t.accent, t.honesty, t.density, t.headline]);
+
+    return (
+      <TweaksPanel title="Tweaks">
+        <TweakSection label="Tone" />
+        <TweakRadio
+          label="Honesty"
+          value={t.honesty}
+          options={["quiet", "loud"]}
+          onChange={(v) => setTweak("honesty", v)}
+        />
+
+        <TweakSection label="Typography" />
+        <TweakRadio
+          label="Wordmark"
+          value={t.headline}
+          options={["serif", "mono"]}
+          onChange={(v) => setTweak("headline", v)}
+        />
+        <TweakRadio
+          label="Density"
+          value={t.density}
+          options={["compact", "regular", "comfy"]}
+          onChange={(v) => setTweak("density", v)}
+        />
+
+        <TweakSection label="Color" />
+        <TweakColor
+          label="Accent"
+          value={t.accent}
+          onChange={(v) => setTweak("accent", v)}
+        />
+      </TweaksPanel>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById("tweaks-root")).render(<App />);
+</script>
+
 </body>
 </html>
