@@ -31,6 +31,16 @@ const server = createServer(async (req, res) => {
             const result = await pdf.renderPage(0, canvas, renderOptions);
             return { audit: pdf.audit(), unsupported: Object.fromEntries(result.unsupportedOperators || []) };
           },
+          renderRepeated: async (base64, options = {}, renderOptions = {}, count = 2) => {
+            const url = ` + "`data:application/pdf;base64,${base64}`" + `;
+            const pdf = await loadPdfCrumb(url, options);
+            const canvas = document.getElementById("c");
+            let result = null;
+            for (let index = 0; index < count; index += 1) {
+              result = await pdf.renderPage(0, canvas, renderOptions);
+            }
+            return { audit: pdf.audit(), unsupported: Object.fromEntries(result?.unsupportedOperators || []) };
+          },
           loadWithAbortedSignal: async (base64) => {
             const controller = new AbortController();
             controller.abort(new Error("test abort"));
@@ -86,6 +96,11 @@ try {
     await assertRejects(render(compressedContentPdf("q\n".repeat(200)), { limits: { maxDecodedStreamBytes: 32 } }), /Decoded Flate stream size|Decoded stream size/);
   });
 
+  await run("does not re-count cached decoded streams on repeated renders", async () => {
+    const result = await renderRepeated(compressedImagePdf(), { limits: { maxDecodedDocumentBytes: 50 } }, {}, 2);
+    assert.deepEqual(result.unsupported, {});
+  });
+
   await run("rejects pages above the content operator budget", async () => {
     await assertRejects(render(contentPdf("q\n".repeat(20)), { limits: { maxContentOperators: 5 } }), /content operators/);
   });
@@ -114,6 +129,10 @@ async function load(pdf, options = {}) {
 
 async function render(pdf, options = {}, renderOptions = {}) {
   return page.evaluate(({ base64, options, renderOptions }) => window.__pdfSecurity.render(base64, options, renderOptions), { base64: b64(pdf), options, renderOptions });
+}
+
+async function renderRepeated(pdf, options = {}, renderOptions = {}, count = 2) {
+  return page.evaluate(({ base64, options, renderOptions, count }) => window.__pdfSecurity.renderRepeated(base64, options, renderOptions, count), { base64: b64(pdf), options, renderOptions, count });
 }
 
 async function assertRejects(promise, pattern) {
@@ -152,6 +171,21 @@ function hugeImagePdf() {
     [2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"],
     [3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /Im1 4 0 R >> >> /Contents 5 0 R >>"],
     [4, "<< /Type /XObject /Subtype /Image /Width 50000 /Height 50000 /BitsPerComponent 8 /ColorSpace /DeviceGray /Length 1 >>\nstream\n0\nendstream"],
+    [5, `<< /Length ${content.length} >>\nstream\n${content.toString("latin1")}\nendstream`],
+  ]);
+}
+
+function compressedImagePdf() {
+  const content = Buffer.from("q 2 0 0 2 0 0 cm /Im1 Do Q", "latin1");
+  const image = deflateSync(Buffer.from([
+    255, 0, 0, 0, 255, 0,
+    0, 0, 255, 255, 255, 0,
+  ]));
+  return buildPdf([
+    [1, "<< /Type /Catalog /Pages 2 0 R >>"],
+    [2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"],
+    [3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /XObject << /Im1 4 0 R >> >> /Contents 5 0 R >>"],
+    [4, `<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8 /ColorSpace /DeviceRGB /Filter /FlateDecode /Length ${image.length} >>\nstream\n${image.toString("latin1")}\nendstream`],
     [5, `<< /Length ${content.length} >>\nstream\n${content.toString("latin1")}\nendstream`],
   ]);
 }

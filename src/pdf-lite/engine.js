@@ -12,7 +12,7 @@ const ENABLE_EXPERIMENTAL_OUTLINES = typeof PDF_LITE_EXPERIMENTAL_OUTLINES === "
 const ENABLE_IMAGES = typeof PDF_LITE_IMAGES === "boolean" ? PDF_LITE_IMAGES : true;
 
 // --- Defensive limits -------------------------------------------------------
-// Generous caps that real PDFs never approach but that keep pathological or
+// Generous caps for complex real-world PDFs that still keep pathological or
 // adversarial inputs bounded. These turn would-be hangs and runaway
 // allocations into fast, deterministic errors.
 export const DEFAULT_SECURITY_LIMITS = Object.freeze({
@@ -30,10 +30,10 @@ export const DEFAULT_SECURITY_LIMITS = Object.freeze({
   maxOperands: 4096,
   maxGraphicsStackDepth: 256,
   maxFormXObjectDepth: 12,
-  maxDecodedStreamBytes: 64 * 1024 * 1024,
+  maxDecodedStreamBytes: 128 * 1024 * 1024,
   maxDecodedDocumentBytes: 256 * 1024 * 1024,
   maxImageDimension: 8192,
-  maxImagePixels: 25_000_000,
+  maxImagePixels: 40_000_000,
   maxFontBytes: 32 * 1024 * 1024,
   maxCMapEntries: 65_536,
   maxIndexedPaletteEntries: 4096,
@@ -86,6 +86,7 @@ class PdfLiteDocument {
     this.warnings = [];
     this.activeContent = new Map();
     this.decodedDocumentBytes = 0;
+    this.decodedStreamCache = new WeakMap();
   }
 
   async parse() {
@@ -493,6 +494,25 @@ class PdfLiteDocument {
   }
 
   async decodeStream(bytes, dictionary = {}) {
+    const cacheKey = dictionary && typeof dictionary === "object" ? dictionary : null;
+    const cached = cacheKey ? this.decodedStreamCache.get(cacheKey) : null;
+    if (cached) {
+      return cached;
+    }
+    const decoded = this.decodeStreamUncached(bytes, dictionary);
+    if (!cacheKey) {
+      return decoded;
+    }
+    this.decodedStreamCache.set(cacheKey, decoded);
+    try {
+      return await decoded;
+    } catch (error) {
+      this.decodedStreamCache.delete(cacheKey);
+      throw error;
+    }
+  }
+
+  async decodeStreamUncached(bytes, dictionary = {}) {
     const filters = normalizeFilters(this.resolve(dictionary.Filter));
     let output = bytes;
     for (const filter of filters) {

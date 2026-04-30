@@ -4,6 +4,7 @@ const defaultManifestPath = new URL("../samples.js", import.meta.url).href;
 const defaultPdfBasePath = new URL("../pdf-files", import.meta.url).href;
 
 const documentSelect = document.getElementById("document-select");
+const uploadInput = document.getElementById("upload-input");
 const scaleInput = document.getElementById("scale-input");
 const pageRangeInput = document.getElementById("page-range-input");
 const viewModeSelect = document.getElementById("view-mode-select");
@@ -19,15 +20,14 @@ const pageStack = document.getElementById("page-stack");
 let documents = [];
 let renderToken = 0;
 let pdfjsModulePromise = null;
+let uploadedDocumentUrl = null;
 
 init();
 
 async function init() {
   try {
     documents = await loadDocuments();
-    documentSelect.innerHTML = documents.map((document) => `
-      <option value="${escapeHtml(document.id)}">${escapeHtml(documentLabel(document))}</option>
-    `).join("");
+    renderDocumentOptions();
     const fromHash = location.hash.replace(/^#/, "");
     if (documents.some((document) => document.id === fromHash)) {
       documentSelect.value = fromHash;
@@ -36,6 +36,12 @@ async function init() {
     documentSelect.addEventListener("change", () => {
       location.hash = documentSelect.value;
       renderSelectedDocument();
+    });
+    uploadInput.addEventListener("change", () => {
+      const file = uploadInput.files?.[0];
+      if (file) {
+        addUploadedDocument(file);
+      }
     });
     scaleInput.addEventListener("input", renderSelectedDocument);
     pageRangeInput.addEventListener("change", renderSelectedDocument);
@@ -74,6 +80,33 @@ async function loadDocuments() {
     ...document,
     pdfUrl: document.pdfUrl ? resolveUrl(document.pdfUrl, manifestPath) : joinUrlPath(pdfBasePath, document.pdfPath),
   }));
+}
+
+function renderDocumentOptions() {
+  documentSelect.innerHTML = documents.map((document) => `
+    <option value="${escapeHtml(document.id)}">${escapeHtml(documentLabel(document))}</option>
+  `).join("");
+}
+
+function addUploadedDocument(file) {
+  if (uploadedDocumentUrl) {
+    URL.revokeObjectURL(uploadedDocumentUrl);
+  }
+  uploadedDocumentUrl = URL.createObjectURL(file);
+  const document = {
+    id: `upload-${Date.now()}`,
+    number: "upload",
+    type: "local file",
+    title: file.name,
+    pdfUrl: uploadedDocumentUrl,
+    fileSize: file.size,
+    uploaded: true,
+  };
+  documents = [document, ...documents.filter((candidate) => !candidate.uploaded)];
+  renderDocumentOptions();
+  documentSelect.value = document.id;
+  location.hash = document.id;
+  renderSelectedDocument();
 }
 
 function renderDocumentFromHash() {
@@ -368,6 +401,7 @@ function documentSummary(document) {
     type: document.type,
     title: document.title,
     pdfUrl: document.pdfUrl,
+    fileSize: document.fileSize,
   };
 }
 
