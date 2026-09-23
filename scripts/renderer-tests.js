@@ -221,6 +221,68 @@ try {
       assert.ok(unsupported.operators.includes("sh/NonIsolatedSoftMask"));
       assert.deepEqual(unsupported.pixel, [0, 0, 255, 255]);
     }],
+    ["applies JPEG and decoded image soft masks before covering existing text", async () => {
+      const jpeg = Buffer.from(await page.evaluate(() => {
+        const canvas = document.createElement("canvas");
+        canvas.width = 20;
+        canvas.height = 1;
+        const context = canvas.getContext("2d");
+        context.fillStyle = "red";
+        context.fillRect(0, 0, 20, 1);
+        return canvas.toDataURL("image/jpeg").split(",")[1];
+      }), "base64");
+      // One-channel JPEG mask: ten black pixels followed by ten white pixels.
+      const jpegMask = Buffer.from(
+        "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAALCAABABQBAREA/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/9oACAEBAAA/AP8AP/r/AF+v+DXH/lBR+wz/AN3M/wDrYf7QVfv9X//Z",
+        "base64"
+      );
+      const flateImage = deflateSync(Buffer.from(Array.from({ length: 20 }, () => [255, 0, 0]).flat()));
+      for (const format of ["jpeg", "flate"]) {
+        for (const maskFormat of ["flate", "jpeg"]) {
+          for (const invert of [false, true]) {
+            const pdf = maskedImagePdf(format === "jpeg" ? jpeg : flateImage, format, invert,
+              false, maskFormat === "jpeg" ? jpegMask : null);
+            const result = await page.evaluate(async (base64) => {
+              const url = `data:application/pdf;base64,${base64}`;
+              const { loadPdfCrumb } = await import("/src/pdf-lite/index.js");
+              const { loadPdfJsDocument, renderPdfJsPage, paintDifferenceCanvas } = await import("/src/comparison.js");
+              const document = await loadPdfCrumb(url);
+              const reference = await loadPdfJsDocument(url);
+              try {
+                const actual = window.document.createElement("canvas");
+                const expected = window.document.createElement("canvas");
+                const output = await document.renderPage(0, actual);
+                await renderPdfJsPage(reference, 0, expected, 1);
+                const sample = (canvas) => [10, 30].map((x) =>
+                  Array.from(canvas.getContext("2d").getImageData(x, 10, 1, 1).data));
+                const difference = paintDifferenceCanvas(window.document.createElement("canvas"), actual, expected);
+                return { actual: sample(actual), expected: sample(expected),
+                  unsupported: [...output.unsupportedOperators.keys()],
+                  strong: difference.substantialPixels / difference.totalPixels };
+              } finally {
+                await reference.destroy();
+              }
+            }, pdf.toString("base64"));
+            assert.deepEqual(result.unsupported, [], JSON.stringify({ format, maskFormat, invert, result }));
+            assert.deepEqual(result.actual[invert ? 1 : 0], [0, 0, 255, 255]);
+            assert.ok(result.actual[invert ? 0 : 1][0] > 230, JSON.stringify(result));
+            assert.ok(result.strong < 0.08, JSON.stringify({ format, maskFormat, invert, result }));
+          }
+        }
+      }
+      const invalid = await page.evaluate(async (base64) => {
+        const { loadPdfCrumb } = await import("/src/pdf-lite/index.js");
+        const pdf = await loadPdfCrumb(`data:application/pdf;base64,${base64}`);
+        const canvas = document.createElement("canvas");
+        const output = await pdf.renderPage(0, canvas);
+        return {
+          unsupported: [...output.unsupportedOperators.keys()],
+          pixel: Array.from(canvas.getContext("2d").getImageData(30, 10, 1, 1).data),
+        };
+      }, maskedImagePdf(jpeg, "jpeg", false, true).toString("base64"));
+      assert.ok(invalid.unsupported.includes("Do/ImageSoftMask"));
+      assert.deepEqual(invalid.pixel, [0, 0, 255, 255]);
+    }],
     ["rejects canvas allocations above the pixel budget", async () => {
       assert.equal((await render(page, pagePdf(""), { maxPagePixels: 400 })).width, 20);
       await assert.rejects(
@@ -732,6 +794,19 @@ function transparencyPdf(variant) {
     [9, "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 40 0] /Function 10 0 R /Extend [true true] >>"],
     [10, "<< /FunctionType 3 /Domain [0 1] /Functions [11 0 R] /Bounds [] /Encode [0 1] >>"],
     [11, `<< /FunctionType 0 /Domain [0 1] /Range [0 1 0 1 0 1] /Size [2] /BitsPerSample 8 /Decode [0 1 0 1 0 1] /Encode [0 1] /Length ${samples.length} >>\nstream\n${samples.toString("latin1")}\nendstream`],
+  ]);
+}
+
+function maskedImagePdf(image, format, invert, invalidMask = false, jpegMask = null) {
+  const content = "0 0 1 rg 0 0 40 20 re f q 40 0 0 20 0 0 cm /Im Do Q";
+  const alpha = jpegMask || deflateSync(Buffer.from(Array.from({ length: 20 }, (_, index) => index < 10 ? 0 : 255)));
+  return buildPdf([
+    [1, "<< /Type /Catalog /Pages 2 0 R >>"],
+    [2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"],
+    [3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 40 20] /Resources << /XObject << /Im 5 0 R >> >> /Contents 4 0 R >>"],
+    [4, `<< /Length ${content.length} >>\nstream\n${content}\nendstream`],
+    [5, `<< /Type /XObject /Subtype /Image /Width 20 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceRGB /Filter /${format === "jpeg" ? "DCTDecode" : "FlateDecode"} /SMask 6 0 R /Length ${image.length} >>\nstream\n${image.toString("latin1")}\nendstream`],
+    [6, `<< /Type /XObject /Subtype /Image /Width ${invalidMask ? 19 : 20} /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray /Filter /${jpegMask ? "DCTDecode" : "FlateDecode"} ${invert ? "/Decode [1 0]" : ""} /Length ${alpha.length} >>\nstream\n${alpha.toString("latin1")}\nendstream`],
   ]);
 }
 

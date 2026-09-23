@@ -1848,7 +1848,27 @@ function evictImage(pdf, entry) {
 
 async function imageBitmapForXObject(renderer, object, filters) {
   if (filters.length === 1 && ["DCTDecode", "DCT"].includes(filters[0])) {
-    return { bitmap: await createImageBitmap(new Blob([object.stream.bytes], { type: "image/jpeg" })), smoothing: true };
+    const bitmap = await createImageBitmap(new Blob([object.stream.bytes], { type: "image/jpeg" }));
+    if (!object.value.SMask) return { bitmap, smoothing: true };
+    try {
+      const width = Number(renderer.pdf.resolve(object.value.Width));
+      const height = Number(renderer.pdf.resolve(object.value.Height));
+      const alpha = await imageAlphaForXObject(renderer, object.value, width, height);
+      if (!alpha) {
+        renderer.unsupported("Do/ImageSoftMask");
+        return null;
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      context.drawImage(bitmap, 0, 0, width, height);
+      const pixels = context.getImageData(0, 0, width, height);
+      for (let index = 0; index < alpha.length; index += 1) pixels.data[index * 4 + 3] = alpha[index];
+      return { bitmap: await createImageBitmap(pixels), smoothing: true };
+    } finally {
+      bitmap.close();
+    }
   }
   if (filters.every(isDataImageFilter)) {
     const imageData = await imageDataForXObject(renderer, object);
@@ -1904,6 +1924,10 @@ async function imageDataForXObject(renderer, object) {
   if (palette) {
     const pixels = unpackIndexedSamples(applyImageDecodeParms(await renderer.pdf.decodeStream(object.stream.bytes, dictionary), dictionary, width, height), bits, width, height, dictionary.Decode);
     const alpha = await imageAlphaForXObject(renderer, dictionary, width, height);
+    if (dictionary.SMask && !alpha) {
+      renderer.unsupported("Do/ImageSoftMask");
+      return null;
+    }
     const imageData = new ImageData(width, height);
     for (let pixelIndex = 0; pixelIndex < width * height; pixelIndex += 1) {
       const color = palette.colors[pixels[pixelIndex]] || palette.colors[0] || [0, 0, 0];
@@ -1933,6 +1957,10 @@ async function imageDataForXObject(renderer, object) {
     return null;
   }
   const alpha = await imageAlphaForXObject(renderer, dictionary, width, height);
+  if (dictionary.SMask && !alpha) {
+    renderer.unsupported("Do/ImageSoftMask");
+    return null;
+  }
   const imageData = new ImageData(width, height);
   for (let pixelIndex = 0; pixelIndex < width * height; pixelIndex += 1) {
     const sourceIndex = pixelIndex * components;
@@ -1967,19 +1995,39 @@ async function imageAlphaForXObject(renderer, dictionary, width, height) {
   const maskWidth = Number(renderer.pdf.resolve(mask.Width));
   const maskHeight = Number(renderer.pdf.resolve(mask.Height));
   const bits = Number(renderer.pdf.resolve(mask.BitsPerComponent));
-  if (maskWidth !== width || maskHeight !== height || bits !== 8 || !validateImageBudget(renderer, mask)) {
+  if (maskWidth !== width || maskHeight !== height || bits !== 8 || mask.Matte !== undefined ||
+      renderer.pdf.resolve(mask.ColorSpace) !== "DeviceGray" || !validateImageBudget(renderer, mask)) {
     return null;
   }
   const filters = normalizeFilters(renderer.pdf.resolve(mask.Filter));
-  if (!filters.every(isDataImageFilter)) {
+  let pixels;
+  if (filters.length === 1 && ["DCTDecode", "DCT"].includes(filters[0])) {
+    const bitmap = await createImageBitmap(new Blob([maskObject.stream.bytes], { type: "image/jpeg" }));
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      context.drawImage(bitmap, 0, 0, width, height);
+      const rgba = context.getImageData(0, 0, width, height).data;
+      pixels = new Uint8Array(width * height);
+      for (let index = 0; index < pixels.length; index += 1) pixels[index] = rgba[index * 4];
+    } finally {
+      bitmap.close();
+    }
+  } else if (filters.every(isDataImageFilter)) {
+    pixels = applyImageDecodeParms(await renderer.pdf.decodeStream(maskObject.stream.bytes, mask), mask, width, height);
+  } else {
     return null;
   }
-  const pixels = applyImageDecodeParms(await renderer.pdf.decodeStream(maskObject.stream.bytes, mask), mask, width, height);
-  const components = imageComponents(renderer.pdf.resolve(mask.ColorSpace), pixels.length, width, height);
-  if (components !== 1 || pixels.length < width * height) {
+  if (pixels.length < width * height) {
     return null;
   }
-  return pixels;
+  const decode = renderer.pdf.resolve(mask.Decode);
+  if (decode === undefined) return pixels.subarray(0, width * height);
+  if (!Array.isArray(decode) || decode.length !== 2 || !decode.every(Number.isFinite)) return null;
+  return Uint8Array.from(pixels.subarray(0, width * height),
+    (sample) => decodeImageComponent(sample, decode[0], decode[1]));
 }
 
 class PdfValueParser {
