@@ -27,6 +27,8 @@ endstream endobj
 endstream endobj
 11 0 obj << /Type /XObject /Subtype /Form /BBox [0 0 20 20] >> stream
 /S sh
+0 1 1 0 k
+0 0 0 1 K
 endstream endobj
 trailer << /Root 1 0 R >>
 %%EOF
@@ -36,7 +38,13 @@ const pdf = await loadPdfCrumb(`data:application/pdf;base64,${pdfBytes.toString(
 const first = await pdf.censusPage(0);
 assert.equal(first.features["form:xobject"], 4);
 assert.equal(first.features["shading:paint"], 2);
+assert.equal(first.features["shading:axial"], undefined);
+assert.equal(first.features["color:DeviceCMYK-fill"], 2);
+assert.equal(first.features["color:DeviceCMYK-stroke"], 2);
+assert.equal(first.features["operator:k"], undefined);
+assert.equal(first.features["operator:K"], undefined);
 assert.equal(first.features["transparency:group"], 2);
+assert.equal(first.features["transparency:nonisolated-group"], 2);
 assert.equal(first.features["transparency:soft-mask"], 1);
 assert.equal(first.features["transparency:blend-mode"], 1);
 assert.equal(first.features["image:bits:1"], 1);
@@ -54,7 +62,8 @@ const summary = summarizeCensus([
 assert.equal(summary.features.find((row) => row.feature === "shading:paint").documents, 2);
 assert.equal(summary.features.find((row) => row.feature === "shading:paint").pages, 2);
 assert.equal(summary.features.find((row) => row.feature === "shading:paint").occurrences, 4);
-assert.equal(summary.features.find((row) => row.feature === "shading:paint").status, "unsupported");
+assert.equal(summary.features.find((row) => row.feature === "shading:paint").status, "partial");
+assert.equal(summary.features.find((row) => row.feature === "transparency:nonisolated-group").status, "unsupported");
 assert.deepEqual(summary.features.find((row) => row.feature === "shading:paint").examples, [
   { file: "first.pdf", page: 1 }, { file: "second.pdf", page: 3 },
 ]);

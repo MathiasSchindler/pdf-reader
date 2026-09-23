@@ -51,6 +51,8 @@ The build uses esbuild plus Terser. The source stays modular enough for developm
 
 Run the browser renderer regression tests with `npm run test:regression`. They cover stream parsing, path painting, canvas allocation limits, indexed image rows, synthetic embedded CID fonts, reader load races, and the comparison page. The default canvas budget is 16 million pixels (`maxPagePixels`); it can be adjusted with `loadPdfCrumb(url, { limits: { maxPagePixels: ... } })`.
 
+Isolated transparency Form XObjects, browser-supported blend modes, and alpha/luminosity soft masks on Form and image XObjects use bounded off-screen canvases. Axial (`ShadingType 2`) shadings with extended endpoints support exponential, stitched, and one-input 8/16-bit sampled color functions in device color spaces. A transparency layer is limited to four million pixels and concurrent layers to twelve million pixels; adjust `maxTransparencyPixels` and `maxActiveTransparencyPixels` in `limits` if necessary. Non-isolated or knockout groups and soft masks on directly painted paths/text are not fully supported and are reported as such. Shading inside a masked, non-isolated group is skipped with an explicit diagnostic rather than darkening the page incorrectly.
+
 The development reader reuses the loaded pdf-crumb and PDF.js documents while the selected URL stays the same. The renderer caches parsed page/form content (up to 16 MiB estimated per document) and decoded image bitmaps (up to 4 million pixels per document); override these budgets with `maxCachedContentBytes` and `maxCachedImagePixels` in `limits`. Repeated glyphs and numeric runs are batched only when their browser advances match the PDF widths, so fonts with different fallback metrics retain individual glyph painting.
 
 Embedded CID-keyed CFF fonts (`CIDFontType0C`) with Identity-H encoding and a usable ToUnicode map are installed as browser fonts with the PDF's CID widths. Embedded TrueType subsets missing browser-required tables are wrapped with a Unicode cmap and installed when their glyph mappings can be established; simple TrueType fonts can also use their embedded outlines directly. Fonts in nested Form XObject resources are discovered as well as page-level fonts. Vertical writing, unsupported CID encodings or glyph maps, invalid embedded data, and embedded Type 1 programs can still use a browser fallback; inspect `pdf.warnings` (and the development reader's font audit) rather than assuming fallback text is faithful. The `Embedded outlines` control does not enable additional CID font support.
@@ -59,7 +61,7 @@ Standard PDF encryption revision 2 (`V=1`, 40-bit RC4) is decrypted before parsi
 
 Run `npm run bench:render -- --runs=5` to benchmark load, first and repeated renders, and compatible-font text against the included `pdf-files/PDF.pdf` and a generated text fixture. The browser benchmark reports median times, text draw calls, and pixel hashes.
 
-Run `npm run census` to scan `pdf-files/` locally without rendering pages. It writes an ignored `pdf-files/census.json` report with per-page feature counts, parse failures, warnings, exact SHA-256 duplicates, and a ranking by distinct PDFs and affected pages with example locations. Pass a directory and output filename with `npm run census -- <directory> <output.json>`; keep reports for private collections outside tracked paths. The scanner follows invoked Form XObjects and counts selected font, image, shading, and transparency uses, but does not inspect inline-image data or prove that observed features render faithfully. `unsupported` and `fallback` labels indicate known gaps; `unverified` marks browser font installations that cannot be checked by the Node-based scanner, and `observed` is not a claim of faithful support. Use `npm run test:census` for synthetic scanner regressions.
+Run `npm run census` to scan `pdf-files/` locally without rendering pages. It writes an ignored `pdf-files/census.json` report with per-page feature counts, parse failures, warnings, exact SHA-256 duplicates, and a ranking by distinct PDFs and affected pages with example locations. Pass a directory and output filename with `npm run census -- <directory> <output.json>`; keep reports for private collections outside tracked paths. The scanner follows invoked Form XObjects and counts selected font, image, shading, and transparency uses, but does not inspect inline-image data or prove that observed features render faithfully. `unsupported` and `fallback` labels indicate known gaps; `partial` flags supported subsets with remaining limitations, `unverified` marks browser font installations that cannot be checked by the Node-based scanner, and `observed` is not a claim of faithful support. Use `npm run test:census` for synthetic scanner regressions.
 
 ## Distribution Files
 
@@ -240,6 +242,8 @@ Currently useful capabilities include:
 - direct outline rendering for safe simple TrueType subsets
 - experimental CFF/Type2 outline diagnostics in the full development build
 - a subset of text, path, clipping, form XObject, color, graphics-state, and image XObject rendering
+- isolated transparency Forms, common Canvas blend modes, Form/image soft masks, and extended axial gradients in supported device color spaces
+- `k` and `K` DeviceCMYK fill/stroke operators, using the same approximate CMYK-to-RGB conversion as `sc` and `SC`
 - JPEG image XObject rendering through browser image decoding
 - simple raw image XObject rendering for gray, RGB, ICC-like, CMYK-like, and Indexed data
 
@@ -250,7 +254,9 @@ Known gaps include:
 - full external graphics state handling
 - text clipping modes
 - calibrated, ICC, indexed, separation, and pattern color spaces beyond the currently implemented subset
-- advanced clipping interactions and transparency groups
+- color-managed CMYK conversion; supported CMYK painting can differ noticeably from PDF.js hues
+- advanced clipping interactions
+- non-isolated/knockout group compositing, direct path/text soft masking, and radial/mesh shadings
 - less common stream filters beyond Flate, ASCIIHex, ASCII85, and RunLength
 
 Treat the output as an experimental rendering, not archival or legally reliable PDF reproduction.

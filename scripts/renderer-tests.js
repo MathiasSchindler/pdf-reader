@@ -100,6 +100,127 @@ try {
         assert.deepEqual(result.edge, [0, 0, 0, 255], operator);
       }
     }],
+    ["paints CMYK fill and stroke and updates device color spaces", async () => {
+      const content = [
+        "0 1 1 0 k 0 0 20 20 re f",
+        "0 0 0 1 K 2 w 3 3 14 14 re S",
+        "1 0 1 0 k 20 0 20 20 re f",
+        "1 1 0 0 k 40 0 20 20 re f",
+        "0 0 0 1 k 60 0 20 20 re f",
+        "0 0 0 0 k 80 0 20 20 re f",
+        "1 1 0 0 k 1 0 0 rg 0 1 0 sc 0 20 20 20 re f",
+        "0 1 1 0 k 0 g 0.5 sc 20 20 20 20 re f",
+        "0 g q 0 0 0 1 k Q 0.5 sc 40 20 20 20 re f",
+        "0 1 1 0 K 0 G 0.5 SC 2 w 65 24 10 10 re S",
+      ].join("\n");
+      const result = await page.evaluate(async (base64) => {
+        const url = `data:application/pdf;base64,${base64}`;
+        const { loadPdfCrumb } = await import("/src/pdf-lite/index.js");
+        const { loadPdfJsDocument, renderPdfJsPage } = await import("/src/comparison.js");
+        const pdf = await loadPdfCrumb(url);
+        const reference = await loadPdfJsDocument(url);
+        try {
+          const actual = document.createElement("canvas");
+          const expected = document.createElement("canvas");
+          await pdf.renderPage(0, actual);
+          await renderPdfJsPage(reference, 0, expected, 1);
+          const points = [[10, 30], [3, 30], [30, 30], [50, 30], [70, 30], [90, 30],
+            [10, 10], [30, 10], [50, 10], [65, 10]];
+          const sample = (canvas) => {
+            const context = canvas.getContext("2d");
+            return points.map(([x, y]) => Array.from(context.getImageData(x, y, 1, 1).data));
+          };
+          return {
+            actual: sample(actual),
+            expected: sample(expected),
+            unsupported: Array.from((await pdf.renderPage(0, actual)).unsupportedOperators.keys()),
+            features: (await pdf.censusPage(0)).features,
+          };
+        } finally {
+          await reference.destroy();
+        }
+      }, pagePdf(content, [0, 0, 100, 40]).toString("base64"));
+      assert.deepEqual(result.actual, [
+        [255, 0, 0, 255], [0, 0, 0, 255], [0, 255, 0, 255],
+        [0, 0, 255, 255], [0, 0, 0, 255], [255, 255, 255, 255],
+        [0, 255, 0, 255], [128, 128, 128, 255], [128, 128, 128, 255],
+        [128, 128, 128, 255],
+      ]);
+      for (const index of [5, 6, 7, 8, 9]) assert.deepEqual(result.actual[index], result.expected[index]);
+      assert.ok(result.expected[0][0] > result.expected[0][1] && result.expected[0][0] > result.expected[0][2]);
+      assert.ok(result.expected[2][1] > result.expected[2][0] && result.expected[2][1] > result.expected[2][2]);
+      assert.ok(result.expected[3][2] > result.expected[3][0] && result.expected[3][2] > result.expected[3][1]);
+      for (const index of [1, 4]) assert.ok(Math.max(...result.expected[index].slice(0, 3)) < 100);
+      assert.deepEqual(result.unsupported, []);
+      assert.equal(result.features["color:DeviceCMYK-fill"], 8);
+      assert.equal(result.features["color:DeviceCMYK-stroke"], 2);
+      assert.equal(result.features["operator:k"], undefined);
+      assert.equal(result.features["operator:K"], undefined);
+    }],
+    ["composites isolated Forms with blend modes and luminosity soft masks", async () => {
+      for (const variant of ["blend", "mask", "alpha", "shading"]) {
+        const result = await page.evaluate(async (base64) => {
+          const url = `data:application/pdf;base64,${base64}`;
+          const { loadPdfCrumb } = await import("/src/pdf-lite/index.js");
+          const { loadPdfJsDocument, renderPdfJsPage, paintDifferenceCanvas } = await import("/src/comparison.js");
+          const pdf = await loadPdfCrumb(url);
+          const reference = await loadPdfJsDocument(url);
+          try {
+            const left = document.createElement("canvas");
+            const right = document.createElement("canvas");
+            const output = await pdf.renderPage(0, left);
+            await renderPdfJsPage(reference, 0, right, 1);
+            const sample = (canvas) => [[10, 10], [30, 10]]
+              .map(([x, y]) => Array.from(canvas.getContext("2d").getImageData(x, y, 1, 1).data));
+            const diff = paintDifferenceCanvas(document.createElement("canvas"), left, right);
+            return {
+              actual: sample(left), expected: sample(right),
+              strong: diff.substantialPixels / diff.totalPixels,
+              unsupported: [...output.unsupportedOperators],
+            };
+          } finally {
+            await reference.destroy();
+          }
+        }, transparencyPdf(variant).toString("base64"));
+        assert.deepEqual(result.unsupported, [], JSON.stringify({ variant, result }));
+        if (variant === "blend") {
+          assert.deepEqual(result.actual, [[0, 0, 0, 255], [0, 0, 0, 255]]);
+        } else if (variant === "alpha") {
+          assert.deepEqual(result.actual, [[255, 0, 0, 255], [255, 0, 0, 255]]);
+        } else {
+          assert.deepEqual(result.actual[1], [0, 0, 255, 255]);
+          if (variant === "mask") assert.deepEqual(result.actual[0], [255, 0, 0, 255]);
+        }
+        assert.ok(result.strong < 0.08, JSON.stringify({ variant, result }));
+      }
+      await assert.rejects(page.evaluate(async (base64) => {
+        const { loadPdfCrumb } = await import("/src/pdf-lite/index.js");
+        const pdf = await loadPdfCrumb(`data:application/pdf;base64,${base64}`, {
+          limits: { maxTransparencyPixels: 100 },
+        });
+        await pdf.renderPage(0, document.createElement("canvas"));
+      }, transparencyPdf("mask").toString("base64")), /Transparency layer pixels/);
+      await assert.rejects(page.evaluate(async (base64) => {
+        const { loadPdfCrumb } = await import("/src/pdf-lite/index.js");
+        const pdf = await loadPdfCrumb(`data:application/pdf;base64,${base64}`, {
+          limits: { maxActiveTransparencyPixels: 1500 },
+        });
+        await pdf.renderPage(0, document.createElement("canvas"));
+      }, transparencyPdf("mask").toString("base64")), /Active transparency pixels/);
+      const unsupported = await page.evaluate(async (base64) => {
+        const { loadPdfCrumb } = await import("/src/pdf-lite/index.js");
+        const pdf = await loadPdfCrumb(`data:application/pdf;base64,${base64}`);
+        const canvas = document.createElement("canvas");
+        const output = await pdf.renderPage(0, canvas);
+        return {
+          operators: [...output.unsupportedOperators.keys()],
+          pixel: Array.from(canvas.getContext("2d").getImageData(10, 10, 1, 1).data),
+        };
+      }, transparencyPdf("nonisolated-shading").toString("base64"));
+      assert.ok(unsupported.operators.includes("Do/TransparencyNonIsolated"));
+      assert.ok(unsupported.operators.includes("sh/NonIsolatedSoftMask"));
+      assert.deepEqual(unsupported.pixel, [0, 0, 255, 255]);
+    }],
     ["rejects canvas allocations above the pixel budget", async () => {
       assert.equal((await render(page, pagePdf(""), { maxPagePixels: 400 })).width, 20);
       await assert.rejects(
@@ -590,6 +711,27 @@ function pagePdf(content, mediaBox = [0, 0, 20, 20], count = 1) {
     [2, `<< /Type /Pages /Kids [${kids}] /Count ${count} >>`],
     [4, `<< /Length ${stream.length} >>\nstream\n${stream.toString("latin1")}\nendstream`],
     ...pages,
+  ]);
+}
+
+function transparencyPdf(variant) {
+  const background = "0 0 1 rg 0 0 40 20 re f";
+  const pageContent = `${background} q /${variant === "blend" ? "Multiply" : "Mask"} gs /Fm Do Q`;
+  const formContent = ["shading", "nonisolated-shading"].includes(variant) ? "/Sh sh" : "1 0 0 rg 0 0 40 20 re f";
+  const maskContent = "1 g 0 0 20 20 re f 0 g 20 0 20 20 re f";
+  const samples = Buffer.from([255, 0, 0, 0, 0, 255]);
+  return buildPdf([
+    [1, "<< /Type /Catalog /Pages 2 0 R >>"],
+    [2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"],
+    [3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 40 20] /Resources << /XObject << /Fm 5 0 R >> /ExtGState << /Mask 6 0 R /Multiply 8 0 R >> >> /Contents 4 0 R >>"],
+    [4, `<< /Length ${pageContent.length} >>\nstream\n${pageContent}\nendstream`],
+    [5, `<< /Type /XObject /Subtype /Form /BBox [0 0 40 20] /Group << /S /Transparency ${variant === "nonisolated-shading" ? "" : "/I true"} /CS /DeviceRGB >> /Resources << /Shading << /Sh 9 0 R >> >> /Length ${formContent.length} >>\nstream\n${formContent}\nendstream`],
+    [6, `<< /Type /ExtGState /SMask << /S /${variant === "alpha" ? "Alpha" : "Luminosity"} /G 7 0 R /BC [0 0 0] >> >>`],
+    [7, `<< /Type /XObject /Subtype /Form /BBox [0 0 40 20] /Group << /S /Transparency /I true /CS /DeviceRGB >> /Length ${maskContent.length} >>\nstream\n${maskContent}\nendstream`],
+    [8, "<< /Type /ExtGState /BM /Multiply >>"],
+    [9, "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 40 0] /Function 10 0 R /Extend [true true] >>"],
+    [10, "<< /FunctionType 3 /Domain [0 1] /Functions [11 0 R] /Bounds [] /Encode [0 1] >>"],
+    [11, `<< /FunctionType 0 /Domain [0 1] /Range [0 1 0 1 0 1] /Size [2] /BitsPerSample 8 /Decode [0 1 0 1 0 1] /Encode [0 1] /Length ${samples.length} >>\nstream\n${samples.toString("latin1")}\nendstream`],
   ]);
 }
 

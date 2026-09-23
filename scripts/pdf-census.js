@@ -19,9 +19,11 @@ async function pdfPaths(folder) {
 
 function featureStatus(feature) {
   if (feature === "operator:BX" || feature === "operator:EX") return "observed";
-  if (feature === "shading:paint" || feature === "transparency:soft-mask" ||
-      feature === "transparency:blend-mode" || feature === "transparency:group" ||
-      feature === "text:clip-mode" || feature.startsWith("operator:") ||
+  if (["shading:paint", "transparency:soft-mask", "transparency:blend-mode", "transparency:group"].includes(feature)) return "partial";
+  if (feature === "text:clip-mode" || feature.startsWith("operator:") ||
+      feature.startsWith("shading:unsupported-type:") ||
+      ["transparency:nonisolated-group", "transparency:knockout-group",
+        "transparency:unsupported-soft-mask", "transparency:unsupported-blend-mode"].includes(feature) ||
       feature.startsWith("image:filter:") &&
         !["FlateDecode", "Fl", "DCTDecode", "DCT", "ASCIIHexDecode", "AHx", "ASCII85Decode", "A85", "RunLengthDecode", "RL"]
           .includes(feature.slice("image:filter:".length))) return "unsupported";
