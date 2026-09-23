@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>pdf-crumb.js A/B comparison</title>
+    <link rel="stylesheet" href="../styles.css">
+    <link rel="stylesheet" href="./style.css">
+  </head>
+  <body>
+    <header class="app-header compare-header">
+      <div>
+        <p class="eyebrow">Local PDF comparison</p>
+        <h1>pdf-crumb / PDF.js</h1>
+      </div>
+      <div class="compare-source">
+        <form id="source-form">
+          <label for="source-path">PDF path on this server</label>
+          <input id="source-path" type="text" value="../pdf-files/PDF.pdf" spellcheck="false">
+          <button type="submit">Open path</button>
+        </form>
+        <label for="file-input">Or upload a PDF
+          <input id="file-input" type="file" accept="application/pdf,.pdf">
+        </label>
+      </div>
+    </header>
+
+    <main class="compare-main">
+      <div class="compare-toolbar">
+        <button id="previous-page" type="button" disabled>Previous</button>
+        <label for="page-number">Page</label>
+        <input id="page-number" type="number" min="1" value="1">
+        <span id="page-total">of 0</span>
+        <button id="next-page" type="button" disabled>Next</button>
+        <label for="scale">Scale</label>
+        <select id="scale">
+          <option value="0.5">50%</option>
+          <option value="0.75">75%</option>
+          <option value="1" selected>100%</option>
+          <option value="1.25">125%</option>
+          <option value="1.5">150%</option>
+          <option value="2">200%</option>
+        </select>
+        <label for="font-mode">pdf-crumb fonts</label>
+        <select id="font-mode">
+          <option value="stable">Stable</option>
+          <option value="embedded">Embedded outlines</option>
+        </select>
+      </div>
+      <p id="status" class="status" role="status" aria-live="polite">Choose a PDF to compare.</p>
+
+      <div class="compare-grid">
+        <section class="compare-panel" aria-labelledby="lite-heading">
+          <h2 id="lite-heading">pdf-crumb</h2>
+          <p id="lite-caption" class="compare-caption"></p>
+          <div id="lite-pane" class="compare-pane"></div>
+        </section>
+        <section class="compare-panel" aria-labelledby="pdfjs-heading">
+          <h2 id="pdfjs-heading">PDF.js reference</h2>
+          <p id="pdfjs-caption" class="compare-caption"></p>
+          <div id="pdfjs-pane" class="compare-pane"></div>
+        </section>
+      </div>
+
+      <section class="compare-panel compare-difference" aria-labelledby="difference-heading">
+        <h2 id="difference-heading">Difference map</h2>
+        <p id="difference-caption" class="compare-caption">Red: pdf-crumb brighter. Green: PDF.js brighter.</p>
+        <div id="difference-pane" class="compare-pane"></div>
+      </section>
+
+      <section class="compare-panel compare-report" aria-labelledby="report-heading">
+        <div class="compare-report-heading">
+          <h2 id="report-heading">Share a finding</h2>
+          <button id="copy-report" type="button" disabled>Copy report</button>
+        </div>
+        <p class="compare-caption">Click a canvas to mark a location. Only the text below is copied; uploaded PDFs stay in your browser.</p>
+        <textarea id="report-output" readonly aria-label="Page comparison report"></textarea>
+      </section>
+    </main>
+
+    <footer class="dev-footer">
+      Run this page on a local static server. PDF.js is a comparison reference, not a fallback renderer; pixel differences also include font rasterization and antialiasing.
+      <a href="../dev/">Development reader</a>
+    </footer>
+    <script type="module" src="../src/compare-app.js"></script>
+  </body>
+</html>

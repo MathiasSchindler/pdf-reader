@@ -10,6 +10,18 @@ const WIN_ANSI = new Map([
 const ENABLE_DIAGNOSTICS = typeof PDF_LITE_DIAGNOSTICS === "boolean" ? PDF_LITE_DIAGNOSTICS : true;
 const ENABLE_EXPERIMENTAL_OUTLINES = typeof PDF_LITE_EXPERIMENTAL_OUTLINES === "boolean" ? PDF_LITE_EXPERIMENTAL_OUTLINES : true;
 const ENABLE_IMAGES = typeof PDF_LITE_IMAGES === "boolean" ? PDF_LITE_IMAGES : true;
+let nextEmbeddedFontId = 0;
+const PASSWORD_PADDING = Uint8Array.from([
+  0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,
+  0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80, 0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a,
+]);
+const MD5_CONSTANTS = Uint32Array.from({ length: 64 }, (_, index) => Math.floor(Math.abs(Math.sin(index + 1)) * 0x100000000));
+const MD5_SHIFTS = [
+  7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+  5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+  4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+  6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+];
 
 // --- Defensive limits -------------------------------------------------------
 // Generous caps for complex real-world PDFs that still keep pathological or
@@ -45,6 +57,9 @@ export const DEFAULT_SECURITY_LIMITS = Object.freeze({
 
 const ACTIVE_CONTENT_KEYS = new Set(["OpenAction", "AA", "JavaScript", "JS", "Launch", "SubmitForm", "GoToR", "URI", "EmbeddedFile", "RichMedia", "XFA"]);
 const ACTIVE_CONTENT_TYPES = new Set(["Action", "Filespec", "EmbeddedFile", "RichMedia", "XFA", "JavaScript", "Launch", "SubmitForm", "GoToR", "URI"]);
+const CENSUS_KNOWN_OPERATORS = new Set(
+  "q Q cm w M d J j rg g RG G cs CS sc scn SC SCN ri i BT ET Tc Tw Tz TL Ts Td TD Tm T* Tj TJ ' \" m l c v y re h W W* S s f F f* B B* b b* n BDC BMC EMC MP DP ID EI".split(" ")
+);
 
 export async function loadPdfLite(url, options = {}) {
   const limits = securityLimits(options.limits);
@@ -55,7 +70,7 @@ export async function loadPdfLite(url, options = {}) {
   }
   const bytes = new Uint8Array(await response.arrayBuffer());
   assertWithinLimit("Input PDF size", bytes.byteLength, limits.maxInputBytes);
-  const pdf = new PdfLiteDocument(bytes, url, { limits, signal: options.signal });
+  const pdf = new PdfLiteDocument(bytes, url, { limits, signal: options.signal, password: options.password });
   await pdf.parse();
   // Reject obviously broken files that parsed to nothing useful. These are
   // structural minimums; any real PDF clears them trivially. Rejecting here
@@ -78,6 +93,7 @@ class PdfLiteDocument {
     this.url = url;
     this.limits = securityLimits(options.limits);
     this.signal = options.signal || null;
+    this.password = options.password ?? "";
     this.source = bytesToBinaryString(bytes);
     this.objects = new Map();
     this.directObjects = 0;
@@ -101,6 +117,11 @@ class PdfLiteDocument {
   async parse() {
     this.checkpoint();
     this.readDirectObjects();
+    try {
+      this.decryptStandardDocument();
+    } finally {
+      this.password = null;
+    }
     await this.readObjectStreams();
     this.collectPages();
     await this.collectFonts();
@@ -172,6 +193,114 @@ class PdfLiteDocument {
         hasSoftMask: Boolean(object.value.SMask),
         imageMask: Boolean(object.value.ImageMask),
       }));
+  }
+
+  async censusPage(index) {
+      if (!ENABLE_DIAGNOSTICS) throw new Error("PDF census requires the full diagnostics build.");
+      this.checkpoint();
+      const page = this.pages[index];
+      if (!page) throw new Error(`Page ${index + 1} not found`);
+      const features = new Map();
+      const errors = [];
+      const activeForms = new Set();
+      const record = (name) => features.set(name, (features.get(name) || 0) + 1);
+      const inspect = async (tokens, resources, depth) => {
+        const operands = [];
+        for (const token of tokens) {
+          this.checkpoint();
+          if (token.type !== "operator") {
+            operands.push(token.value);
+            if (operands.length > this.limits.maxOperands) throw new Error(`PDF limit exceeded: content operands > ${this.limits.maxOperands}`);
+            continue;
+          }
+          const values = operands.splice(0);
+          const name = values.at(-1);
+          switch (token.value) {
+            case "sh":
+              record("shading:paint");
+              break;
+            case "BI":
+              record("image:inline");
+              break;
+            case "Tr":
+              if ([4, 5, 6, 7].includes(Number(name))) record("text:clip-mode");
+              break;
+            case "Tf": {
+              const fontRef = this.resolve(resources?.Font)?.[values[0]];
+              const font = this.resolve(fontRef);
+              if (!font) {
+                errors.push(`Missing font resource ${values[0]}`);
+                break;
+              }
+              record(`font:${font.Subtype || "unknown"}`);
+              const installed = this.fonts.get(fontRef?.ref || fontRef);
+              const unverified = installed && !installed.embeddedFontLoaded &&
+                (["Type1C", "CIDFontType0C"].includes(installed.embeddedFontFormat) && !installed.embeddedFontError ||
+                  installed.embeddedFontFormat === "truetype" && installed.embeddedFontError ===
+                    "TrueType subset is missing browser-required OS/2 table");
+              if (unverified && !installed.embeddedOutlineUsable) record("font:browser-install-unverified");
+              else if (installed?.embeddedFontError && !installed.embeddedOutlineUsable) record("font:embedded-fallback");
+              if (depth > 0 && !installed) record("font:form-resource-uncollected");
+              break;
+            }
+            case "gs": {
+              const state = this.resolve(this.resolve(resources?.ExtGState)?.[name]);
+              if (!state) {
+                errors.push(`Missing graphics state ${name}`);
+                break;
+              }
+              if (state.SMask && state.SMask !== "None") record("transparency:soft-mask");
+              if (state.BM && state.BM !== "Normal" && state.BM !== "Compatible") record("transparency:blend-mode");
+              if (state.ca !== undefined && state.ca !== 1 || state.CA !== undefined && state.CA !== 1) record("transparency:alpha");
+              break;
+            }
+            case "Do": {
+              const object = this.objectFor(this.resolve(resources?.XObject)?.[name]);
+              if (!object?.stream) {
+                errors.push(`Missing XObject ${name}`);
+                break;
+              }
+              const dictionary = object.value;
+              if (dictionary.Subtype === "Image") {
+                record("image:xobject");
+                const bits = this.resolve(dictionary.BitsPerComponent);
+                if (bits !== undefined) record(`image:bits:${bits}`);
+                for (const filter of normalizeFilters(this.resolve(dictionary.Filter))) record(`image:filter:${filter}`);
+                if (dictionary.SMask) record("image:soft-mask");
+                if (dictionary.Mask) record("image:mask");
+                if (dictionary.ImageMask) record("image:stencil");
+              } else if (dictionary.Subtype === "Form") {
+                record("form:xobject");
+                const group = this.resolve(dictionary.Group);
+                if (group?.S === "Transparency") record("transparency:group");
+                if (activeForms.has(object.id)) {
+                  errors.push(`Cyclic Form XObject ${object.id}`);
+                } else if (depth >= this.limits.maxFormXObjectDepth) {
+                  errors.push(`Form XObject depth limit (${this.limits.maxFormXObjectDepth}) reached`);
+                } else {
+                  activeForms.add(object.id);
+                  try {
+                    const bytes = await this.decodeStream(object.stream.bytes, dictionary);
+                    const formTokens = this.tokenizeCached(dictionary, bytesToBinaryString(bytes));
+                    await inspect(formTokens, this.resolve(dictionary.Resources) || resources, depth + 1);
+                  } catch (error) {
+                    errors.push(`Form XObject ${object.id}: ${error.message}`);
+                  } finally {
+                    activeForms.delete(object.id);
+                  }
+                }
+              } else {
+                record(`xobject:${dictionary.Subtype || "unknown"}`);
+              }
+              break;
+            }
+            default:
+              if (!CENSUS_KNOWN_OPERATORS.has(token.value)) record(`operator:${token.value}`);
+          }
+        }
+      };
+      await inspect(await this.pageTokens(page, index), page.resources, 0);
+      return { features: Object.fromEntries(Array.from(features).sort()), errors };
   }
 
   auditActiveContent() {
@@ -337,6 +466,60 @@ class PdfLiteDocument {
     }
   }
 
+  decryptStandardDocument() {
+    const startxref = this.source.lastIndexOf("startxref");
+    let trailerIndex = this.source.lastIndexOf("trailer", startxref);
+    let trailer = null;
+    while (trailerIndex >= 0 && !trailer?.Encrypt) {
+      trailer = new PdfValueParser(this.source, trailerIndex + 7).parseValue();
+      trailerIndex = this.source.lastIndexOf("trailer", trailerIndex - 1);
+    }
+    if (!trailer?.Encrypt) {
+      trailer = Array.from(this.objects.values()).reverse().find((object) => object.value?.Type === "XRef" && object.value.Encrypt)?.value;
+    }
+    if (!trailer?.Encrypt) return;
+    const encryptRef = trailer.Encrypt;
+    const encryption = this.objectFor(encryptRef)?.value;
+    if (!encryptRef?.ref || !encryption) throw new Error("Invalid PDF encryption dictionary.");
+    if (encryption.Filter !== "Standard" || encryption.R !== 2 || encryption.V !== 1 ||
+        (encryption.Length !== undefined && encryption.Length !== 40)) {
+      throw new Error(`Unsupported PDF encryption: ${encryption.Filter || "unknown"} revision ${encryption.R ?? "unknown"} (V ${encryption.V ?? "unknown"}).`);
+    }
+    if (typeof this.password !== "string" || [...this.password].some((char) => char.charCodeAt(0) > 255)) {
+      throw new Error("PDF password must be a byte string.");
+    }
+    const owner = pdfStringBytes(encryption.O);
+    const user = pdfStringBytes(encryption.U);
+    const id = pdfStringBytes(trailer.ID?.[0]);
+    if (owner.length !== 32 || user.length !== 32 || !id.length || !Number.isInteger(encryption.P)) {
+      throw new Error("Invalid Standard PDF encryption parameters.");
+    }
+    const padded = new Uint8Array(32);
+    const password = Uint8Array.from(this.password, (char) => char.charCodeAt(0));
+    padded.set(password.subarray(0, 32));
+    padded.set(PASSWORD_PADDING.subarray(0, 32 - Math.min(32, password.length)), Math.min(32, password.length));
+    const permissions = new Uint8Array(4);
+    writeLittleEndian(permissions, 0, encryption.P, 4);
+    const deriveKey = (userPassword) => md5(concatBytes(userPassword, owner, permissions, id)).subarray(0, 5);
+    const validKey = (key) => rc4(key, PASSWORD_PADDING).every((byte, index) => byte === user[index]);
+    let fileKey = deriveKey(padded);
+    if (!validKey(fileKey)) {
+      // An owner password recovers the padded user password through the O entry.
+      fileKey = deriveKey(rc4(md5(padded).subarray(0, 5), owner));
+      if (!validKey(fileKey)) throw new Error("Cannot decrypt PDF: a valid password is required.");
+    }
+    for (const object of this.objects.values()) {
+      this.checkpoint();
+      if (object.id === encryptRef.ref) continue;
+      const suffix = new Uint8Array(5);
+      writeLittleEndian(suffix, 0, object.id, 3);
+      writeLittleEndian(suffix, 3, object.generation, 2);
+      const objectKey = md5(concatBytes(fileKey, suffix)).subarray(0, 10);
+      object.value = decryptPdfStrings(object.value, objectKey);
+      if (object.stream) object.stream.bytes = rc4(objectKey, object.stream.bytes, this.signal);
+    }
+  }
+
   async readObjectStreams() {
     const streams = Array.from(this.objects.values()).filter((object) => object.value?.Type === "ObjStm" && object.stream);
     this.objectStreams = streams.length;
@@ -434,11 +617,16 @@ class PdfLiteDocument {
   }
 
   async collectFonts() {
-    for (const page of this.pages) {
+    const visitedResources = new Map();
+    const visitedForms = new Map();
+    const collect = async (resources, depth) => {
       this.checkpoint();
-      const fonts = this.resolve(page.resources?.Font) || {};
+      resources = this.resolve(resources);
+      if (!resources || (visitedResources.get(resources) ?? Infinity) <= depth) return;
+      visitedResources.set(resources, depth);
+      const fonts = this.resolve(resources.Font) || {};
       for (const [resourceName, fontRef] of Object.entries(fonts)) {
-        const objectId = fontRef?.ref || `${resourceName}:${Object.keys(this.fonts).length}`;
+        const objectId = fontRef?.ref || fontRef;
         if (this.fonts.has(objectId)) {
           continue;
         }
@@ -462,9 +650,14 @@ class PdfLiteDocument {
         const descriptor = this.resolve(font.FontDescriptor) || this.resolve(descendantFont?.FontDescriptor) || null;
         const embeddedFont = await this.loadEmbeddedFont(resourceName, font, descendantFont, descriptor);
         const metrics = buildFontMetrics(font, descendantFont, toUnicode);
-        await installEmbeddedBrowserFont(embeddedFont, metrics, toUnicode);
-        const embeddedOutlineUsable = Boolean(embeddedFont?.outlineFont && embeddedFont.outlineFont.kind !== "cff" && !metrics.isCidFont && toUnicode?.size);
+        await installEmbeddedBrowserFont(embeddedFont, metrics, toUnicode, font, descendantFont);
+        const embeddedOutlineUsable = Boolean(embeddedFont?.format === "truetype" && embeddedFont.outlineFont &&
+          !metrics.isCidFont && embeddedFont.outlineFont.cmap.size);
         const embeddedOutlineExperimental = Boolean(ENABLE_EXPERIMENTAL_OUTLINES && embeddedFont?.outlineFont?.kind === "cff" && !metrics.isCidFont && toUnicode?.size);
+        if (embeddedOutlineUsable && embeddedFont?.error === embeddedFont.outlineFont.browserInstallableError) embeddedFont.error = null;
+        if (embeddedFont?.error) {
+          this.warnings.push(`Font ${resourceName} (${font.BaseFont || "unknown"}): ${embeddedFont.error}`);
+        }
         this.fonts.set(objectId, {
           objectId,
           resourceName,
@@ -488,7 +681,20 @@ class PdfLiteDocument {
           isCidFont: metrics.isCidFont,
         });
       }
-    }
+      if (depth >= this.limits.maxFormXObjectDepth) {
+        if (ENABLE_DIAGNOSTICS && Object.keys(this.resolve(resources.XObject) || {}).length) {
+          this.warnings.push(`Form font discovery depth limit (${this.limits.maxFormXObjectDepth}) reached.`);
+        }
+        return;
+      }
+      for (const ref of Object.values(this.resolve(resources.XObject) || {})) {
+        const object = this.objectFor(ref);
+        if (object?.value?.Subtype !== "Form" || (visitedForms.get(object.id) ?? Infinity) <= depth) continue;
+        visitedForms.set(object.id, depth);
+        await collect(this.resolve(object.value.Resources) || resources, depth + 1);
+      }
+    };
+    for (const page of this.pages) await collect(page.resources, 0);
   }
 
   async loadEmbeddedFont(resourceName, font, descendantFont, descriptor) {
@@ -501,7 +707,7 @@ class PdfLiteDocument {
       return null;
     }
     const format = entry.format === "fontfile3" ? object.value.Subtype || entry.format : entry.format;
-    const family = `PdfLite-${resourceName}-${object.id}`;
+    const family = `PdfLite-${++nextEmbeddedFontId}-${resourceName}-${object.id}`;
     const embedded = { family, format, loaded: false, error: null, outlineFont: null, bytes: null };
     let bytes;
     try {
@@ -510,15 +716,19 @@ class PdfLiteDocument {
       embedded.bytes = bytes;
       if (format === "truetype") {
         embedded.outlineFont = parseTrueTypeFont(bytes);
-      } else if (format === "Type1C") {
+      } else if (format === "Type1C" || format === "CIDFontType0C") {
         embedded.outlineFont = parseCffFont(bytes);
-        embedded.error = "Type1C/CFF outlines are parsed for diagnostics but not painted yet";
+        if (!embedded.outlineFont || (format === "CIDFontType0C") !== embedded.outlineFont.cidKeyed) {
+          throw new Error(`Invalid ${format} font data`);
+        }
+      } else if (format !== "truetype") {
+        embedded.error = `Unsupported embedded font format ${format}`;
       }
     } catch (error) {
       embedded.error = error.message;
       return embedded;
     }
-    embedded.error ||= embedded.outlineFont?.browserInstallableError || null;
+    if (format === "truetype") embedded.error ||= embedded.outlineFont?.browserInstallableError || null;
     return embedded;
   }
 
@@ -1067,10 +1277,10 @@ class ContentRenderer {
   currentFont() {
     const fonts = this.pdf.resolve(this.resources?.Font) || {};
     const ref = fonts[this.state.fontName];
-    if (!ref?.ref) {
+    if (!ref) {
       return null;
     }
-    return this.pdf.fonts.get(ref.ref);
+    return this.pdf.fonts.get(ref.ref || ref);
   }
 
   colorSpace(name) {
@@ -1425,10 +1635,15 @@ async function imageDataForXObject(renderer, object) {
     }
     return imageData;
   }
-  if (bits !== 8) {
+  if (bits !== 8 && (![1, 2, 4].includes(bits) || colorSpace !== "DeviceGray")) {
     return null;
   }
-  const pixels = applyImageDecodeParms(await renderer.pdf.decodeStream(object.stream.bytes, dictionary), dictionary, width, height);
+  let pixels = applyImageDecodeParms(await renderer.pdf.decodeStream(object.stream.bytes, dictionary), dictionary, width, height);
+  if (bits !== 8) {
+    if (pixels.length < Math.ceil(width * bits / 8) * height) return null;
+    const maxSample = (1 << bits) - 1;
+    pixels = Uint8Array.from(unpackIndexedSamples(pixels, bits, width, height), (sample) => Math.round(sample * 255 / maxSample));
+  }
   const components = imageComponents(colorSpace, pixels.length, width, height);
   if (![1, 3, 4].includes(components)) {
     return null;
@@ -1841,6 +2056,104 @@ function bytesToBinaryString(bytes) {
     chunks.push(String.fromCharCode(...bytes.subarray(index, index + 0x8000)));
   }
   return chunks.join("");
+}
+
+function pdfStringBytes(value) {
+  if (value?.hex !== undefined) return hexStringToBytes(value.hex);
+  if (value?.string !== undefined) return Uint8Array.from(value.string, (char) => char.charCodeAt(0));
+  return new Uint8Array();
+}
+
+function decryptPdfStrings(value, key) {
+  if (value?.hex !== undefined) {
+    return { hex: Array.from(rc4(key, pdfStringBytes(value)), (byte) => byte.toString(16).padStart(2, "0")).join("") };
+  }
+  if (value?.string !== undefined) {
+    return { string: bytesToBinaryString(rc4(key, pdfStringBytes(value))) };
+  }
+  if (Array.isArray(value)) return value.map((entry) => decryptPdfStrings(entry, key));
+  if (value && typeof value === "object" && !value.ref) {
+    return Object.fromEntries(Object.entries(value).map(([name, entry]) => [name, decryptPdfStrings(entry, key)]));
+  }
+  return value;
+}
+
+function concatBytes(...parts) {
+  const result = new Uint8Array(parts.reduce((length, part) => length + part.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    result.set(part, offset);
+    offset += part.length;
+  }
+  return result;
+}
+
+function writeLittleEndian(bytes, offset, value, length) {
+  for (let index = 0; index < length; index += 1) {
+    bytes[offset + index] = Math.floor(value / 256 ** index) & 0xff;
+  }
+}
+
+function md5(bytes) {
+  const padded = new Uint8Array(Math.ceil((bytes.length + 9) / 64) * 64);
+  padded.set(bytes);
+  padded[bytes.length] = 0x80;
+  writeLittleEndian(padded, padded.length - 8, bytes.length * 8, 8);
+  const state = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+  for (let offset = 0; offset < padded.length; offset += 64) {
+    const words = new Uint32Array(16);
+    for (let index = 0; index < 16; index += 1) {
+      const start = offset + index * 4;
+      words[index] = (padded[start] | padded[start + 1] << 8 | padded[start + 2] << 16 | padded[start + 3] << 24) >>> 0;
+    }
+    let [a, b, c, d] = state;
+    for (let index = 0; index < 64; index += 1) {
+      let f;
+      let word;
+      if (index < 16) {
+        f = (b & c) | (~b & d);
+        word = index;
+      } else if (index < 32) {
+        f = (d & b) | (~d & c);
+        word = (5 * index + 1) % 16;
+      } else if (index < 48) {
+        f = b ^ c ^ d;
+        word = (3 * index + 5) % 16;
+      } else {
+        f = c ^ (b | ~d);
+        word = (7 * index) % 16;
+      }
+      const value = (a + f + MD5_CONSTANTS[index] + words[word]) >>> 0;
+      [a, b, c, d] = [d, (b + ((value << MD5_SHIFTS[index]) | (value >>> (32 - MD5_SHIFTS[index])))) >>> 0, b, c];
+    }
+    state[0] = (state[0] + a) >>> 0;
+    state[1] = (state[1] + b) >>> 0;
+    state[2] = (state[2] + c) >>> 0;
+    state[3] = (state[3] + d) >>> 0;
+  }
+  const result = new Uint8Array(16);
+  state.forEach((word, index) => writeLittleEndian(result, index * 4, word, 4));
+  return result;
+}
+
+function rc4(key, bytes, signal = null) {
+  const permutation = Uint8Array.from({ length: 256 }, (_, index) => index);
+  let position = 0;
+  for (let index = 0; index < 256; index += 1) {
+    position = (position + permutation[index] + key[index % key.length]) & 255;
+    [permutation[index], permutation[position]] = [permutation[position], permutation[index]];
+  }
+  const result = new Uint8Array(bytes.length);
+  let left = 0;
+  let right = 0;
+  for (let index = 0; index < bytes.length; index += 1) {
+    if ((index & 0x7fff) === 0) assertNotAborted(signal);
+    left = (left + 1) & 255;
+    right = (right + permutation[left]) & 255;
+    [permutation[left], permutation[right]] = [permutation[right], permutation[left]];
+    result[index] = bytes[index] ^ permutation[(permutation[left] + permutation[right]) & 255];
+  }
+  return result;
 }
 
 function isPdfDelimiter(code) {
@@ -2603,25 +2916,84 @@ function embeddedFontEntry(descriptor) {
   return null;
 }
 
-async function installEmbeddedBrowserFont(embedded, metrics, toUnicode) {
-  if (!embedded?.bytes || embedded.loaded || embedded.format !== "Type1C" || embedded.outlineFont?.kind !== "cff" || typeof document === "undefined" || !document.fonts) {
+async function installEmbeddedBrowserFont(embedded, metrics, toUnicode, font, descendantFont) {
+  if (!embedded?.bytes || embedded.loaded || !["Type1C", "CIDFontType0C", "truetype"].includes(embedded.format)) {
     return;
   }
+  if (typeof document === "undefined") return;
+  if (!document.fonts || typeof FontFace === "undefined") {
+    embedded.error = "Browser font installation is unavailable";
+    return;
+  }
+  if (embedded.format === "CIDFontType0C" && (!metrics.isCidFont || font.Encoding !== "Identity-H")) {
+    embedded.error = `Unsupported CID CFF encoding ${String(font.Encoding || "unknown")}`;
+    return;
+  }
+  if (embedded.format === "truetype" && embedded.outlineFont?.browserInstallable) return;
   try {
-    const fontBytes = buildOpenTypeCffFont(embedded.bytes, embedded.outlineFont, metrics, toUnicode, embedded.family);
-    const fontFace = new FontFace(embedded.family, fontBytes.buffer.slice(fontBytes.byteOffset, fontBytes.byteOffset + fontBytes.byteLength));
+    const fontBytes = embedded.format === "truetype"
+      ? buildOpenTypeTrueTypeFont(embedded.outlineFont, toUnicode, font, descendantFont, embedded.family)
+      : buildOpenTypeCffFont(embedded.bytes, embedded.outlineFont, metrics, toUnicode, embedded.family);
+    const fontFace = new FontFace(embedded.family, fontBytes.buffer.slice(fontBytes.byteOffset, fontBytes.byteOffset + fontBytes.byteLength), {
+      weight: fontWeightFor({ baseFont: font.BaseFont }),
+      style: fontStyleFor({ baseFont: font.BaseFont }),
+    });
     await fontFace.load();
     document.fonts.add(fontFace);
     embedded.loaded = true;
     embedded.error = null;
   } catch (error) {
-    embedded.error = `Could not wrap Type1C/CFF as OpenType: ${error.message}`;
+    embedded.error = `Could not install embedded ${embedded.format} font: ${error.message}`;
   }
+}
+
+function buildOpenTypeTrueTypeFont(outlineFont, toUnicode, font, descendantFont, family) {
+  if (!outlineFont) throw new Error("Missing TrueType outlines");
+  const cmap = new Map();
+  if (font.Subtype === "Type0") {
+    if (font.Encoding !== "Identity-H" || descendantFont?.CIDToGIDMap && descendantFont.CIDToGIDMap !== "Identity") {
+      throw new Error("Unsupported CID TrueType encoding or CIDToGIDMap");
+    }
+    for (const [hex, text] of toUnicode || []) {
+      const chars = Array.from(text);
+      const glyph = parseInt(hex, 16);
+      if (chars.length === 1 && glyph > 0 && glyph < outlineFont.glyphCount) {
+        const unicode = chars[0].codePointAt(0);
+        if (unicode < 0xffff) cmap.set(unicode, glyph);
+      }
+    }
+  } else {
+    for (const [code, glyph] of outlineFont.cmap) {
+      if (glyph <= 0 || glyph >= outlineFont.glyphCount || code > 0xff) continue;
+      const text = toUnicode?.get(code.toString(16).toUpperCase().padStart(2, "0")) || decodeWinAnsi([code]);
+      const chars = Array.from(text);
+      if (chars.length === 1 && chars[0].codePointAt(0) < 0xffff) cmap.set(chars[0].codePointAt(0), glyph);
+    }
+  }
+  if (!cmap.size || cmap.size > 8190) throw new Error("No usable Unicode-to-glyph mappings in embedded TrueType font");
+  const tables = new Map();
+  for (const [tag, table] of outlineFont.tables) {
+    if (table.offset + table.length > outlineFont.bytes.length) throw new Error(`Invalid TrueType table ${tag}`);
+    if (tag !== "cmap" && tag !== "name" && tag !== "OS/2") {
+      const bytes = outlineFont.bytes.slice(table.offset, table.offset + table.length);
+      if (tag === "head") writeUint32(bytes, 8, 0);
+      tables.set(tag, bytes);
+    }
+  }
+  for (const tag of ["head", "hhea", "hmtx", "maxp", "glyf", "loca"]) {
+    if (!tables.has(tag)) throw new Error(`Missing TrueType table ${tag}`);
+  }
+  tables.set("cmap", buildCmapTable(cmap));
+  tables.set("name", buildNameTable(family));
+  tables.set("OS/2", buildOs2Table(cmap));
+  if (!tables.has("post")) tables.set("post", buildPostTable());
+  return buildSfnt("\x00\x01\x00\x00", tables);
 }
 
 function buildOpenTypeCffFont(cffBytes, cffFont, metrics, toUnicode, family) {
   const glyphCount = cffFont.charStrings.length;
   const cmap = cffUnicodeGlyphMap(cffFont, metrics, toUnicode);
+  if (!cmap.size) throw new Error("No usable Unicode-to-glyph mappings in embedded CFF font");
   const widths = cffGlyphWidths(cffFont, metrics);
   const tables = new Map([
     ["CFF ", cffBytes],
@@ -2639,6 +3011,16 @@ function buildOpenTypeCffFont(cffBytes, cffFont, metrics, toUnicode, family) {
 
 function cffUnicodeGlyphMap(cffFont, metrics, toUnicode) {
   const map = new Map();
+  if (cffFont.cidKeyed) {
+    for (const [hex, text] of toUnicode || []) {
+      const chars = Array.from(text);
+      if (chars.length !== 1) continue;
+      const unicode = chars[0].codePointAt(0);
+      const glyphIndex = cffFont.cidToGlyph.get(parseInt(hex, 16));
+      if (unicode < 0xffff && Number.isFinite(glyphIndex)) map.set(unicode, glyphIndex);
+    }
+    return map;
+  }
   for (const [code, glyphName] of metrics.codeToGlyphName || []) {
     const glyphIndex = cffFont.nameToGlyph.get(glyphName);
     if (!Number.isFinite(glyphIndex)) {
@@ -2675,6 +3057,11 @@ function unicodeForGlyphName(name) {
 
 function cffGlyphWidths(cffFont, metrics) {
   const widths = new Array(cffFont.charStrings.length).fill(Number.isFinite(metrics.defaultWidth) ? metrics.defaultWidth : 500);
+  if (cffFont.cidKeyed) {
+    for (const [cid, glyphIndex] of cffFont.cidToGlyph) {
+      widths[glyphIndex] = metrics.widths.get(cid) ?? widths[glyphIndex];
+    }
+  }
   for (const [code, glyphName] of metrics.codeToGlyphName || []) {
     const glyphIndex = cffFont.nameToGlyph.get(glyphName);
     if (Number.isFinite(glyphIndex)) {
@@ -2923,7 +3310,10 @@ function parseCffFont(bytes) {
   }
   const charStrings = readCffIndex(bytes, charStringsOffset).objects;
   const strings = stringIndex.objects.map((value) => bytesToBinaryString(value));
-  const charset = readCffCharset(bytes, topDict.charset || 0, charStrings.length, strings);
+  const cidKeyed = Array.isArray(topDict.ROS);
+  const charset = cidKeyed
+    ? readCffCidCharset(bytes, topDict.charset, charStrings.length)
+    : readCffCharset(bytes, topDict.charset || 0, charStrings.length, strings);
   let localSubrs = [];
   if (ENABLE_EXPERIMENTAL_OUTLINES && Array.isArray(topDict.Private)) {
     const privateOffset = topDict.Private[1];
@@ -2935,11 +3325,13 @@ function parseCffFont(bytes) {
   }
   return {
     kind: "cff",
+    cidKeyed,
+    cidToGlyph: cidKeyed ? new Map(charset.map((cid, index) => [cid, index])) : null,
     unitsPerEm: 1000,
     fontMatrix: cffFontMatrix(topDict.FontMatrix),
     charStrings,
     charset,
-    nameToGlyph: new Map(charset.map((name, index) => [name, index])),
+    nameToGlyph: cidKeyed ? new Map() : new Map(charset.map((name, index) => [name, index])),
     localSubrs,
     localSubrBias: cffSubrBias(localSubrs.length),
     globalSubrs: globalSubrIndex.objects,
@@ -3004,6 +3396,7 @@ function assignCffDictOperator(dict, operator, operands) {
   if (operator === "17") dict.CharStrings = value;
   if (operator === "18") dict.Private = operands;
   if (operator === "19") dict.Subrs = value;
+  if (operator === "12 30") dict.ROS = operands;
 }
 
 function readCffNumber(bytes, offset) {
@@ -3070,6 +3463,28 @@ function readCffCharset(bytes, offset, glyphCount, strings) {
     }
   }
   return names;
+}
+
+function readCffCidCharset(bytes, offset, glyphCount) {
+  if (!Number.isInteger(offset) || offset <= 0 || offset >= bytes.length) {
+    throw new Error("CID CFF charset is missing");
+  }
+  const cids = [0];
+  const format = bytes[offset++];
+  if (![0, 1, 2].includes(format)) throw new Error(`Unsupported CID CFF charset format ${format}`);
+  while (cids.length < glyphCount) {
+    const rangeBytes = format === 0 ? 2 : format === 1 ? 3 : 4;
+    if (offset + rangeBytes > bytes.length) throw new Error("Truncated CID CFF charset");
+    const first = readUint16(bytes, offset);
+    offset += 2;
+    const additional = format === 0 ? 0 : format === 1 ? bytes[offset++] : readUint16(bytes, offset);
+    if (format === 2) offset += 2;
+    if (first + additional > 0xffff || cids.length + additional + 1 > glyphCount) {
+      throw new Error("Invalid CID CFF charset range");
+    }
+    for (let cid = first; cid <= first + additional; cid += 1) cids.push(cid);
+  }
+  return cids;
 }
 
 function cffString(sid, strings) {

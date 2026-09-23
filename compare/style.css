@@ -1,0 +1,167 @@
+body {
+  height: auto;
+  min-height: 100vh;
+  display: block;
+}
+
+.compare-header {
+  flex-wrap: wrap;
+}
+
+.compare-source {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+}
+
+.compare-source form,
+.compare-source label {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+#source-path {
+  width: min(45vw, 490px);
+  padding: 7px 9px;
+}
+
+#file-input {
+  width: 190px;
+  padding: 5px 8px;
+}
+
+.compare-main {
+  display: grid;
+  gap: 16px;
+  padding: 20px;
+}
+
+.compare-toolbar,
+.compare-report-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+#page-number {
+  width: 70px;
+  min-height: 34px;
+  padding: 6px;
+  text-align: center;
+}
+
+.compare-main > .status {
+  margin: 0;
+}
+
+.compare-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.compare-panel {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.compare-caption {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.compare-pane {
+  min-height: 100px;
+  max-height: 70vh;
+  overflow: auto;
+  background: #e6eaf0;
+}
+
+.compare-stage {
+  position: relative;
+  width: max-content;
+}
+
+.compare-stage canvas {
+  cursor: crosshair;
+  box-shadow: none;
+}
+
+.compare-marker {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  border: 2px solid #f5a623;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.45);
+  box-shadow: 0 0 0 1px #151515;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.compare-marker::before,
+.compare-marker::after {
+  content: "";
+  position: absolute;
+  background: #fff;
+}
+
+.compare-marker::before {
+  top: 6px;
+  left: -5px;
+  width: 24px;
+  height: 2px;
+}
+
+.compare-marker::after {
+  top: -5px;
+  left: 6px;
+  width: 2px;
+  height: 24px;
+}
+
+.compare-report-heading {
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.compare-report-heading h2 {
+  margin-bottom: 0;
+}
+
+#report-output {
+  display: block;
+  width: 100%;
+  min-height: 180px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--ink);
+  background: var(--panel-soft);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  resize: vertical;
+}
+
+.compare-panel-error {
+  padding: 16px;
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 860px) {
+  .compare-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  #source-path {
+    width: min(90vw, 490px);
+  }
+}

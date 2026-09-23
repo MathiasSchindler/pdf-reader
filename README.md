@@ -29,6 +29,7 @@ Useful local pages:
 - `http://localhost:8787/`: project page with a live pdf-crumb.js render of `pdf-files/PDF.pdf`.
 - `http://localhost:8787/dist/demo/`: minimal distribution demo using the viewer bundle, the same sample PDF, file upload, and drag/drop.
 - `http://localhost:8787/dev/`: development reader with sample selection, PDF.js comparison mode, difference view, renderer audit, and font-mode controls.
+- `http://localhost:8787/compare/`: side-by-side page for investigating a local PDF in both renderers and copying a page-specific discrepancy report.
 
 ## Install And Build
 
@@ -48,11 +49,17 @@ npm run build
 
 The build uses esbuild plus Terser. The source stays modular enough for development, while each distribution profile is emitted as one minified JavaScript file.
 
-Run the browser renderer regression tests with `npm run test:regression`. They cover stream parsing, path painting, canvas allocation limits, indexed image rows, and demo load races. The default canvas budget is 16 million pixels (`maxPagePixels`); it can be adjusted with `loadPdfCrumb(url, { limits: { maxPagePixels: ... } })`.
+Run the browser renderer regression tests with `npm run test:regression`. They cover stream parsing, path painting, canvas allocation limits, indexed image rows, synthetic embedded CID fonts, reader load races, and the comparison page. The default canvas budget is 16 million pixels (`maxPagePixels`); it can be adjusted with `loadPdfCrumb(url, { limits: { maxPagePixels: ... } })`.
 
 The development reader reuses the loaded pdf-crumb and PDF.js documents while the selected URL stays the same. The renderer caches parsed page/form content (up to 16 MiB estimated per document) and decoded image bitmaps (up to 4 million pixels per document); override these budgets with `maxCachedContentBytes` and `maxCachedImagePixels` in `limits`. Repeated glyphs and numeric runs are batched only when their browser advances match the PDF widths, so fonts with different fallback metrics retain individual glyph painting.
 
+Embedded CID-keyed CFF fonts (`CIDFontType0C`) with Identity-H encoding and a usable ToUnicode map are installed as browser fonts with the PDF's CID widths. Embedded TrueType subsets missing browser-required tables are wrapped with a Unicode cmap and installed when their glyph mappings can be established; simple TrueType fonts can also use their embedded outlines directly. Fonts in nested Form XObject resources are discovered as well as page-level fonts. Vertical writing, unsupported CID encodings or glyph maps, invalid embedded data, and embedded Type 1 programs can still use a browser fallback; inspect `pdf.warnings` (and the development reader's font audit) rather than assuming fallback text is faithful. The `Embedded outlines` control does not enable additional CID font support.
+
+Standard PDF encryption revision 2 (`V=1`, 40-bit RC4) is decrypted before parsing page streams and object strings. Empty-password documents open normally; for a document with a user or owner password, pass `{ password: "..." }` to `loadPdfCrumb`. Other encryption revisions and incorrect passwords produce an explicit load error instead of a blank page. The comparison page does not ask for passwords, so it can open encrypted documents only when the empty password is valid. Packed 1-, 2-, and 4-bit grayscale images (including barcodes) are supported with row padding and `/Decode` polarity.
+
 Run `npm run bench:render -- --runs=5` to benchmark load, first and repeated renders, and compatible-font text against the included `pdf-files/PDF.pdf` and a generated text fixture. The browser benchmark reports median times, text draw calls, and pixel hashes.
+
+Run `npm run census` to scan `pdf-files/` locally without rendering pages. It writes an ignored `pdf-files/census.json` report with per-page feature counts, parse failures, warnings, exact SHA-256 duplicates, and a ranking by distinct PDFs and affected pages with example locations. Pass a directory and output filename with `npm run census -- <directory> <output.json>`; keep reports for private collections outside tracked paths. The scanner follows invoked Form XObjects and counts selected font, image, shading, and transparency uses, but does not inspect inline-image data or prove that observed features render faithfully. `unsupported` and `fallback` labels indicate known gaps; `unverified` marks browser font installations that cannot be checked by the Node-based scanner, and `observed` is not a claim of faithful support. Use `npm run test:census` for synthetic scanner regressions.
 
 ## Distribution Files
 
@@ -110,6 +117,7 @@ The root UI, sample manifest, PDF.js comparator, and difference view are not bun
 pdf-reader/
   index.html                 project page
   dev/index.html             development reader UI
+  compare/index.html         side-by-side comparison UI
   dist/demo/index.html       minimal embeddable demo
   pdf-files/PDF.pdf          freely licensed public sample PDF
   samples.js                 local development manifest
@@ -117,6 +125,8 @@ pdf-reader/
   fixtures/                  commit-safe fixture PDFs
   src/
     reader-app.js            development reader behavior
+    compare-app.js           comparison page behavior
+    comparison.js            shared PDF.js and pixel-difference helpers
     pdf-lite.js              compatibility re-export
     pdf-lite/
       index.js               public source entry
@@ -134,6 +144,14 @@ The development reader loads `samples.js` by default. The default manifest inclu
 The `Pages` control accepts `all`, a single page such as `3`, a range such as `1-5`, or a comma-separated list such as `1,3,7-9`. The `View` control switches between pdf-crumb, PDF.js, and Difference. The difference view renders the same selected pages through both engines, compares pixels, and paints matching pixels black. Pixels where pdf-crumb is brighter are red; pixels where PDF.js is brighter are green.
 
 PDF.js is only a development comparator in this project. It is not a fallback renderer for pdf-crumb, and production behavior should not silently switch to PDF.js when pdf-crumb lacks a feature. The vendored files in `vendor/pdfjs/` retain the Mozilla Foundation copyright and Apache-2.0 license notices; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Side-by-side comparison
+
+Open `http://localhost:8787/compare/` from a static server started at the project root. Enter a PDF path served by that same server (for example `../pdf-files/PDF.pdf`), or select a PDF from your computer. A path, page, scale, and font mode can be bookmarked as `http://localhost:8787/compare/?pdf=../pdf-files/PDF.pdf&page=3&scale=1.5&font=stable`. Uploads are accessed through a temporary browser blob URL; they are not uploaded to a service, added to the sample manifest, or included in the shareable URL. If you send someone an uploaded-PDF report, they will need their own copy of that PDF.
+
+The page renders pdf-crumb and PDF.js simultaneously, with a red/green difference map. Click a location in either canvas or the difference map to mark the same relative position in all three views. Use **Copy report** to share the PDF name, page, scale, marked coordinates, error messages, and renderer warnings without sharing the PDF bytes. A same-origin path in the report is useful for a local discussion but is not accessible to another person unless they serve that PDF at the same path.
+
+The pixel report counts differences above **2/255** in any colour channel and separately counts strong differences above **20/255**; it is a diagnostic, not a quality score. Font antialiasing and dimensions may cause many cosmetic differences. The stronger count and the marked location help distinguish those from missing or seriously misrendered content. If the rendered canvas dimensions differ, the map cannot align the pages and the report says so. To avoid excessive memory use, this comparison page limits each canvas to four million pixels; reduce the scale for large pages.
 
 Use a separate local manifest for private test corpora. The manifest and PDF base path can be overridden from the development reader URL:
 
