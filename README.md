@@ -50,6 +50,10 @@ The build uses esbuild plus Terser. The source stays modular enough for developm
 
 Run the browser renderer regression tests with `npm run test:regression`. They cover stream parsing, path painting, canvas allocation limits, indexed image rows, and demo load races. The default canvas budget is 16 million pixels (`maxPagePixels`); it can be adjusted with `loadPdfCrumb(url, { limits: { maxPagePixels: ... } })`.
 
+The development reader reuses the loaded pdf-crumb and PDF.js documents while the selected URL stays the same. The renderer caches parsed page/form content (up to 16 MiB estimated per document) and decoded image bitmaps (up to 4 million pixels per document); override these budgets with `maxCachedContentBytes` and `maxCachedImagePixels` in `limits`. Repeated glyphs and numeric runs are batched only when their browser advances match the PDF widths, so fonts with different fallback metrics retain individual glyph painting.
+
+Run `npm run bench:render -- --runs=5` to benchmark load, first and repeated renders, and compatible-font text against the included `pdf-files/PDF.pdf` and a generated text fixture. The browser benchmark reports median times, text draw calls, and pixel hashes.
+
 ## Distribution Files
 
 The public bundle names use `pdf-crumb`:

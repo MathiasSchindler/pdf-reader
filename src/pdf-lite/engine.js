@@ -25,6 +25,8 @@ export const DEFAULT_SECURITY_LIMITS = Object.freeze({
   maxPageKids: 8192,
   maxPageDimensionPx: 16_384,
   maxPagePixels: 16_000_000,
+  maxCachedContentBytes: 16 * 1024 * 1024,
+  maxCachedImagePixels: 4_000_000,
   maxContentStreamBytes: 64 * 1024 * 1024,
   maxContentTokens: 1_000_000,
   maxContentOperators: 250_000,
@@ -88,6 +90,12 @@ class PdfLiteDocument {
     this.activeContent = new Map();
     this.decodedDocumentBytes = 0;
     this.decodedStreamCache = new WeakMap();
+    this.contentTokenCache = new Map();
+    this.cachedContentBytes = 0;
+    if (ENABLE_IMAGES) {
+      this.imageCache = new Map();
+      this.cachedImagePixels = 0;
+    }
   }
 
   async parse() {
@@ -254,20 +262,52 @@ class PdfLiteDocument {
     context.fillStyle = "#fff";
     context.fillRect(0, 0, width * scale, height * scale);
     const renderer = new ContentRenderer(this, page, context, { scale, width, height, boxWidth, boxHeight, rotation, originX: pageBox[0], originY: pageBox[1], fontMode: options.fontMode || "stable", signal: options.signal });
+    const tokens = await this.pageTokens(page, index);
+    this.checkpoint();
+    await renderer.interpret(tokens);
+    return { unsupportedOperators: ENABLE_DIAGNOSTICS ? renderer.unsupportedOperators : new Map() };
+  }
+
+  async pageTokens(page, index) {
+    const cached = this.cachedTokens(page);
+    if (cached) return cached;
     const streams = await this.getPageContentStreams(page);
+    const decoded = [];
     let totalBytes = 0;
-    const safeStreams = [];
     for (const stream of streams) {
       totalBytes += stream.length;
       if (totalBytes > this.limits.maxContentStreamBytes) {
         if (ENABLE_DIAGNOSTICS) this.warnings.push(`Content stream truncated at ${this.limits.maxContentStreamBytes} bytes for page ${index + 1}.`);
         break;
       }
-      safeStreams.push(stream);
+      decoded.push(stream);
     }
-    this.checkpoint();
-    await renderer.interpret(safeStreams.map((stream) => bytesToBinaryString(stream)).join("\n"));
-    return { unsupportedOperators: ENABLE_DIAGNOSTICS ? renderer.unsupportedOperators : new Map() };
+    const existing = this.cachedTokens(page);
+    if (existing) return existing;
+    return this.tokenizeCached(page, decoded.map((stream) => bytesToBinaryString(stream)).join("\n"));
+  }
+
+  cachedTokens(key) {
+    const entry = this.contentTokenCache.get(key);
+    if (!entry) return null;
+    this.contentTokenCache.delete(key);
+    this.contentTokenCache.set(key, entry);
+    return entry.tokens;
+  }
+
+  tokenizeCached(key, content) {
+    const tokens = tokenizeContent(content, this.limits.maxContentTokens);
+    const bytes = content.length * 2 + tokens.length * 48;
+    if (bytes <= this.limits.maxCachedContentBytes) {
+      while (this.cachedContentBytes + bytes > this.limits.maxCachedContentBytes) {
+        const oldest = this.contentTokenCache.keys().next().value;
+        this.cachedContentBytes -= this.contentTokenCache.get(oldest).bytes;
+        this.contentTokenCache.delete(oldest);
+      }
+      this.contentTokenCache.set(key, { tokens, bytes });
+      this.cachedContentBytes += bytes;
+    }
+    return tokens;
   }
 
   readDirectObjects() {
@@ -574,6 +614,7 @@ class ContentRenderer {
     this.resources = page.resources || {};
     this.resourceStack = [];
     this.xObjectDepth = 0;
+    this.glyphWidths = new Map();
   }
 
   defaultState() {
@@ -608,7 +649,7 @@ class ContentRenderer {
 
   async interpret(content) {
     assertNotAborted(this.signal);
-    const tokens = tokenizeContent(content, this.pdf.limits.maxContentTokens);
+    const tokens = typeof content === "string" ? tokenizeContent(content, this.pdf.limits.maxContentTokens) : content;
     const operands = [];
     let operators = 0;
     for (const token of tokens) {
@@ -889,15 +930,56 @@ class ContentRenderer {
   paintGlyphRun(glyphs, unitScale, fontSize) {
     const font = this.currentFont();
     let x = 0;
+    let batch = "";
+    let batchX = 0;
+    const canBatch = "fontKerning" in this.context && this.state.charSpacing === 0 &&
+      this.state.wordSpacing === 0 && this.state.textRenderingMode < 4 &&
+      !(font?.hasEmbeddedFont && !font.embeddedFontLoaded) &&
+      !font?.embeddedOutlineUsable && !(this.fontMode === "embedded" && font?.embeddedOutlineExperimental);
+    const first = glyphs[0];
+    if (canBatch && glyphs.length > 1 && first.text.toLowerCase() !== "f" &&
+        glyphs.every((glyph) => glyph.text === first.text && glyph.width === first.width) &&
+        this.canBatchGlyph(first, unitScale)) {
+      this.context.fontKerning = "none";
+      this.paintText(first.text.repeat(glyphs.length), 0, 0);
+      return this.glyphAdvance(first, unitScale) * glyphs.length;
+    }
+    const flush = () => {
+      if (batch) {
+        if (batch.length > 1) this.context.fontKerning = "none";
+        this.paintText(batch, batchX * unitScale, 0);
+        batch = "";
+      }
+    };
     for (const glyph of glyphs) {
-      if (glyph.text) {
+      const eligible = canBatch && /^[0-9]$/.test(glyph.text) && this.canBatchGlyph(glyph, unitScale);
+      if (!eligible) flush();
+      if (eligible) {
+        if (!batch) batchX = x;
+        batch += glyph.text;
+      } else if (glyph.text) {
         if (!this.paintEmbeddedGlyph(font, glyph, x * unitScale, fontSize)) {
           this.paintText(glyph.text, x * unitScale, 0);
         }
       }
       x += this.glyphAdvance(glyph, unitScale) + this.spacingAdvance(glyph.text);
     }
+    flush();
     return x;
+  }
+
+  canBatchGlyph(glyph, unitScale) {
+    if (!Number.isFinite(glyph.width) || !/^[A-Za-z0-9]$/.test(glyph.text)) return false;
+    const font = this.context.font;
+    let widths = this.glyphWidths.get(font);
+    if (!widths) {
+      widths = new Map();
+      this.glyphWidths.set(font, widths);
+    }
+    if (!widths.has(glyph.text)) {
+      widths.set(glyph.text, this.context.measureText(glyph.text).width);
+    }
+    return Math.abs(widths.get(glyph.text) - this.glyphAdvance(glyph, unitScale) * unitScale) < 0.02;
   }
 
   paintEmbeddedGlyph(font, glyph, x, fontSize) {
@@ -1055,12 +1137,16 @@ class ContentRenderer {
       return;
     }
     const dictionary = object.value;
-    let stream;
-    try {
-      stream = await this.pdf.decodeStream(object.stream.bytes, dictionary);
-    } catch (error) {
-      this.unsupported("Do/FormFilter");
-      return;
+    let tokens = this.pdf.cachedTokens(dictionary);
+    if (!tokens) {
+      let stream;
+      try {
+        stream = await this.pdf.decodeStream(object.stream.bytes, dictionary);
+      } catch (error) {
+        this.unsupported("Do/FormFilter");
+        return;
+      }
+      tokens = this.pdf.tokenizeCached(dictionary, bytesToBinaryString(stream));
     }
     this.context.save();
     this.resourceStack.push(this.resources);
@@ -1071,7 +1157,7 @@ class ContentRenderer {
     if (matrix) {
       this.state.ctm = multiplyMatrix(this.state.ctm, matrix);
     }
-    await this.interpret(bytesToBinaryString(stream));
+    await this.interpret(tokens);
     this.state = previousState;
     this.resources = this.resourceStack.pop() || this.page.resources || {};
     this.xObjectDepth -= 1;
@@ -1214,25 +1300,77 @@ async function paintImageXObject(renderer, object) {
       renderer.unsupported("Do/ImageLimit");
       return;
     }
-    if (filters.length === 1 && ["DCTDecode", "DCT"].includes(filters[0])) {
-      const image = await createImageBitmap(new Blob([object.stream.bytes], { type: "image/jpeg" }));
-      drawUnitImage(renderer, image);
-      image.close?.();
+    if (await paintCachedImage(renderer, object, filters)) {
       return;
-    }
-    if (filters.every(isDataImageFilter)) {
-      const imageData = await imageDataForXObject(renderer, object);
-      if (imageData) {
-        const image = await createImageBitmap(imageData);
-        drawUnitImage(renderer, image, { smoothing: !isIndexedColorSpace(renderer.pdf.resolve(object.value.ColorSpace)) });
-        image.close?.();
-        return;
-      }
     }
     renderer.unsupported(`Do/Image/${filters.join("+") || "raw"}`);
   } catch (error) {
     renderer.unsupported("Do/ImageDecode");
   }
+}
+
+async function paintCachedImage(renderer, object, filters) {
+  const pdf = renderer.pdf;
+  const key = object.value;
+  let entry = pdf.imageCache.get(key);
+  if (entry) {
+    pdf.imageCache.delete(key);
+    pdf.imageCache.set(key, entry);
+  } else {
+    const pixels = Number(pdf.resolve(key.Width)) * Number(pdf.resolve(key.Height));
+    entry = { key, pixels, users: 0, evicted: pixels > pdf.limits.maxCachedImagePixels, bitmap: null,
+      promise: imageBitmapForXObject(renderer, object, filters) };
+    if (!entry.evicted) {
+      while (pdf.cachedImagePixels + pixels > pdf.limits.maxCachedImagePixels) {
+        evictImage(pdf, pdf.imageCache.values().next().value);
+      }
+      pdf.imageCache.set(key, entry);
+      pdf.cachedImagePixels += pixels;
+    }
+  }
+  entry.users += 1;
+  try {
+    const result = await entry.promise;
+    entry.bitmap = result?.bitmap || null;
+    if (!result) {
+      evictImage(pdf, entry);
+      return false;
+    }
+    drawUnitImage(renderer, result.bitmap, { smoothing: result.smoothing });
+    return true;
+  } catch (error) {
+    evictImage(pdf, entry);
+    throw error;
+  } finally {
+    entry.users -= 1;
+    if (entry.evicted && entry.users === 0) entry.bitmap?.close();
+  }
+}
+
+function evictImage(pdf, entry) {
+  if (entry.evicted) return;
+  entry.evicted = true;
+  if (pdf.imageCache.get(entry.key) === entry) {
+    pdf.imageCache.delete(entry.key);
+    pdf.cachedImagePixels -= entry.pixels;
+  }
+  if (entry.users === 0) entry.bitmap?.close();
+}
+
+async function imageBitmapForXObject(renderer, object, filters) {
+  if (filters.length === 1 && ["DCTDecode", "DCT"].includes(filters[0])) {
+    return { bitmap: await createImageBitmap(new Blob([object.stream.bytes], { type: "image/jpeg" })), smoothing: true };
+  }
+  if (filters.every(isDataImageFilter)) {
+    const imageData = await imageDataForXObject(renderer, object);
+    if (imageData) {
+      return {
+        bitmap: await createImageBitmap(imageData),
+        smoothing: !isIndexedColorSpace(renderer.pdf.resolve(object.value.ColorSpace)),
+      };
+    }
+  }
+  return null;
 }
 
 function drawUnitImage(renderer, image, options = {}) {

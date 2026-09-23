@@ -19,6 +19,9 @@ const pageStack = document.getElementById("page-stack");
 
 let documents = [];
 let renderToken = 0;
+let renderController = null;
+let loadedPdfEntry = null;
+let pdfjsEntry = null;
 let pdfjsModulePromise = null;
 let uploadedDocumentUrl = null;
 
@@ -186,6 +189,9 @@ async function renderSelectedDocument() {
     return;
   }
   const token = ++renderToken;
+  renderController?.abort();
+  const controller = new AbortController();
+  renderController = controller;
   const scale = Number(scaleInput.value) || 1;
   const viewMode = viewModeSelect.value || "lite";
   const fontMode = fontModeSelect.value || "stable";
@@ -195,8 +201,9 @@ async function renderSelectedDocument() {
   operatorOutput.textContent = "";
   differenceOutput.textContent = "";
   documentOutput.textContent = formatObject(documentSummary(selectedDocument));
+  let activePdfjsEntry = null;
   try {
-    const pdf = await loadPdfLite(selectedDocument.pdfUrl);
+    const pdf = await getLoadedPdf(selectedDocument.pdfUrl);
     if (token !== renderToken) {
       return;
     }
@@ -204,9 +211,9 @@ async function renderSelectedDocument() {
     auditOutput.textContent = formatObject(summary);
     const pageIndexes = parsePageRange(pageRangeInput.value, pdf.pages.length);
     const pageSelection = formatPageSelection(pageIndexes, pdf.pages.length);
-    const pdfjsDocument = viewMode === "lite" ? null : await loadPdfJsDocument(selectedDocument.pdfUrl);
+    activePdfjsEntry = viewMode === "lite" ? null : await acquirePdfJsDocument(selectedDocument.pdfUrl);
+    const pdfjsDocument = activePdfjsEntry?.document || null;
     if (token !== renderToken) {
-      await pdfjsDocument?.destroy();
       return;
     }
     setStatus(`Parsed ${documentLabel(selectedDocument)}: ${summary.pages} pages, ${summary.objects} objects. Rendering ${pageSelection} in ${viewModeLabel(viewMode)} mode with ${fontModeLabel(fontMode)} fonts.`);
@@ -214,7 +221,6 @@ async function renderSelectedDocument() {
     const differences = [];
     for (const index of pageIndexes) {
       if (token !== renderToken) {
-        await pdfjsDocument?.destroy();
         return;
       }
       const frame = document.createElement("article");
@@ -225,7 +231,10 @@ async function renderSelectedDocument() {
       const canvas = document.createElement("canvas");
       frame.append(label, canvas);
       pageStack.appendChild(frame);
-      const result = await renderPageForMode({ pdf, pdfjsDocument, index, canvas, scale, viewMode, fontMode });
+      const result = await renderPageForMode({ pdf, pdfjsDocument, index, canvas, scale, viewMode, fontMode, signal: controller.signal });
+      if (token !== renderToken) {
+        return;
+      }
       for (const [operator, count] of result.unsupportedOperators) {
         unsupported.set(operator, (unsupported.get(operator) || 0) + count);
       }
@@ -234,7 +243,6 @@ async function renderSelectedDocument() {
         label.textContent = `Page ${index + 1} · ${formatDifference(result.difference)}`;
       }
     }
-    await pdfjsDocument?.destroy();
     operatorOutput.textContent = formatUnsupported(unsupported);
     differenceOutput.textContent = formatDifferences(differences);
     setStatus(`Rendered ${documentLabel(selectedDocument)}: ${pageSelection} in ${viewModeLabel(viewMode)} mode with ${fontModeLabel(fontMode)} fonts`);
@@ -242,23 +250,73 @@ async function renderSelectedDocument() {
     if (token === renderToken) {
       setStatus(error.userInput ? error.message : error.stack || error.message, true);
     }
+  } finally {
+    if (activePdfjsEntry) {
+      releasePdfJsDocument(activePdfjsEntry);
+    }
   }
 }
 
-async function renderPageForMode({ pdf, pdfjsDocument, index, canvas, scale, viewMode, fontMode }) {
+function getLoadedPdf(url) {
+  if (loadedPdfEntry?.url !== url) {
+    retirePdfJsDocument();
+    loadedPdfEntry = { url, promise: loadPdfLite(url) };
+  }
+  const entry = loadedPdfEntry;
+  return entry.promise.catch((error) => {
+    if (loadedPdfEntry === entry) loadedPdfEntry = null;
+    throw error;
+  });
+}
+
+async function acquirePdfJsDocument(url) {
+  if (pdfjsEntry?.url !== url) {
+    retirePdfJsDocument();
+    pdfjsEntry = { url, promise: loadPdfJsDocument(url), document: null, users: 0, retired: false };
+  }
+  const entry = pdfjsEntry;
+  entry.users += 1;
+  try {
+    entry.document = await entry.promise;
+    return entry;
+  } catch (error) {
+    releasePdfJsDocument(entry);
+    if (pdfjsEntry === entry) pdfjsEntry = null;
+    throw error;
+  }
+}
+
+function releasePdfJsDocument(entry) {
+  entry.users -= 1;
+  if (entry.retired && entry.users === 0 && entry.document) {
+    entry.document.destroy().catch((error) => console.error("Could not close PDF.js document:", error));
+  }
+}
+
+function retirePdfJsDocument() {
+  if (!pdfjsEntry) return;
+  const entry = pdfjsEntry;
+  pdfjsEntry = null;
+  entry.retired = true;
+  if (entry.users === 0 && entry.document) {
+    entry.document.destroy().catch((error) => console.error("Could not close PDF.js document:", error));
+  }
+}
+
+async function renderPageForMode({ pdf, pdfjsDocument, index, canvas, scale, viewMode, fontMode, signal }) {
   if (viewMode === "pdfjs") {
     await renderPdfJsPage(pdfjsDocument, index, canvas, scale);
     return { unsupportedOperators: new Map() };
   }
   if (viewMode === "diff") {
-    return renderDifferencePage(pdf, pdfjsDocument, index, canvas, scale, fontMode);
+    return renderDifferencePage(pdf, pdfjsDocument, index, canvas, scale, fontMode, signal);
   }
-  return pdf.renderPage(index, canvas, { scale, fontMode });
+  return pdf.renderPage(index, canvas, { scale, fontMode, signal });
 }
 
-async function renderDifferencePage(pdf, pdfjsDocument, index, canvas, scale, fontMode) {
+async function renderDifferencePage(pdf, pdfjsDocument, index, canvas, scale, fontMode, signal) {
   const liteCanvas = document.createElement("canvas");
-  const result = await pdf.renderPage(index, liteCanvas, { scale, fontMode });
+  const result = await pdf.renderPage(index, liteCanvas, { scale, fontMode, signal });
   const pdfjsCanvas = document.createElement("canvas");
   await renderPdfJsPage(pdfjsDocument, index, pdfjsCanvas, scale);
   const difference = paintDifferenceCanvas(canvas, liteCanvas, pdfjsCanvas);
