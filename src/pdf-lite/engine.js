@@ -24,6 +24,7 @@ export const DEFAULT_SECURITY_LIMITS = Object.freeze({
   maxPageDepth: 64,
   maxPageKids: 8192,
   maxPageDimensionPx: 16_384,
+  maxPagePixels: 16_000_000,
   maxContentStreamBytes: 64 * 1024 * 1024,
   maxContentTokens: 1_000_000,
   maxContentOperators: 250_000,
@@ -243,6 +244,7 @@ class PdfLiteDocument {
     const pixelRatio = window.devicePixelRatio || 1;
     const pixelWidth = Math.min(this.limits.maxPageDimensionPx, Math.max(1, Math.floor(width * scale * pixelRatio)));
     const pixelHeight = Math.min(this.limits.maxPageDimensionPx, Math.max(1, Math.floor(height * scale * pixelRatio)));
+    this.limit("Page canvas pixels", pixelWidth * pixelHeight, this.limits.maxPagePixels);
     canvas.width = pixelWidth;
     canvas.height = pixelHeight;
     canvas.style.width = `${Math.floor(width * scale)}px`;
@@ -280,16 +282,17 @@ class PdfLiteDocument {
       const id = Number(match[1]);
       const generation = Number(match[2]);
       const start = match.index + match[0].length;
-      const end = this.source.indexOf("endobj", start);
+      const parser = new PdfValueParser(this.source, start);
+      const value = parser.parseValue();
+      parser.skipWhitespace();
+      const stream = extractStream(this.source, this.bytes, parser.position, value);
+      const end = this.source.indexOf("endobj", stream?.end ?? parser.position);
       if (end < 0) {
         continue;
       }
-      const raw = this.source.slice(start, end).trim();
-      const parsed = parsePdfObject(raw);
-      const stream = extractStream(this.source, this.bytes, start, end, parsed.value);
-      this.objects.set(id, { id, generation, value: parsed.value, stream });
+      this.objects.set(id, { id, generation, value, stream });
       this.directObjects += 1;
-      recordFilter(this.filters, parsed.value);
+      recordFilter(this.filters, value);
       objectPattern.lastIndex = end + 6;
     }
   }
@@ -792,21 +795,21 @@ class ContentRenderer {
         this.fill("evenodd");
         break;
       case "B":
-        this.fill();
+        this.fill("nonzero", false);
         this.stroke();
         break;
       case "B*":
-        this.fill("evenodd");
+        this.fill("evenodd", false);
         this.stroke();
         break;
       case "b":
         this.context.closePath();
-        this.fill();
+        this.fill("nonzero", false);
         this.stroke();
         break;
       case "b*":
         this.context.closePath();
-        this.fill("evenodd");
+        this.fill("evenodd", false);
         this.stroke();
         break;
       case "n":
@@ -1190,15 +1193,17 @@ class ContentRenderer {
     this.state.currentSubpathStart = null;
   }
 
-  fill(rule = "nonzero") {
+  fill(rule = "nonzero", clearPath = true) {
     this.context.save();
     this.context.fillStyle = this.state.fill;
     this.context.globalAlpha = this.state.fillAlpha;
     this.context.fill(rule);
     this.context.restore();
-    this.context.beginPath();
-    this.state.currentPoint = null;
-    this.state.currentSubpathStart = null;
+    if (clearPath) {
+      this.context.beginPath();
+      this.state.currentPoint = null;
+      this.state.currentSubpathStart = null;
+    }
   }
 }
 
@@ -1515,14 +1520,9 @@ class PdfValueParser {
   }
 }
 
-function parsePdfObject(raw) {
-  const parser = new PdfValueParser(raw);
-  return { value: parser.parseValue() };
-}
-
-function extractStream(source, bytes, objectStart, objectEnd, dictionary) {
-  const streamIndex = source.indexOf("stream", objectStart);
-  if (streamIndex < 0 || streamIndex > objectEnd || !dictionary || typeof dictionary !== "object") {
+function extractStream(source, bytes, streamIndex, dictionary) {
+  if (!source.startsWith("stream", streamIndex) || !["\r", "\n"].includes(source[streamIndex + 6]) ||
+      !dictionary || typeof dictionary !== "object") {
     return null;
   }
   let dataStart = streamIndex + 6;
@@ -1532,16 +1532,26 @@ function extractStream(source, bytes, objectStart, objectEnd, dictionary) {
     dataStart += 1;
   }
   const declaredLength = streamLength(source, dictionary.Length);
-  let dataEnd = Number.isFinite(declaredLength) && declaredLength > 0 ? dataStart + declaredLength : source.indexOf("endstream", dataStart);
-  if (dataEnd < 0 || dataEnd > objectEnd) {
+  const hasLength = Number.isInteger(declaredLength) && declaredLength >= 0;
+  let dataEnd = hasLength ? dataStart + declaredLength : source.indexOf("endstream", dataStart);
+  if (dataEnd < 0 || dataEnd > bytes.length) {
     return null;
   }
-  if (!Number.isFinite(declaredLength) || declaredLength <= 0) {
+  let endstream = dataEnd;
+  if (hasLength) {
+    while (WHITESPACE.has(source.charCodeAt(endstream))) {
+      endstream += 1;
+    }
+  }
+  if (!source.startsWith("endstream", endstream)) {
+    return null;
+  }
+  if (!hasLength) {
     while (dataEnd > dataStart && [10, 13].includes(bytes[dataEnd - 1])) {
       dataEnd -= 1;
     }
   }
-  return { bytes: bytes.slice(dataStart, dataEnd) };
+  return { bytes: bytes.slice(dataStart, dataEnd), end: endstream + 9 };
 }
 
 function streamLength(source, value) {
@@ -1949,10 +1959,12 @@ function unpackIndexedSamples(bytes, bits, width, height, decode) {
     return output;
   }
   const mask = (1 << bits) - 1;
-  let outputIndex = 0;
-  for (const byte of bytes) {
-    for (let shift = 8 - bits; shift >= 0 && outputIndex < sampleCount; shift -= bits) {
-      output[outputIndex++] = (byte >> shift) & mask;
+  const rowBytes = Math.ceil(width * bits / 8);
+  for (let row = 0; row < height; row += 1) {
+    for (let column = 0; column < width; column += 1) {
+      const bitOffset = column * bits;
+      const byte = bytes[row * rowBytes + (bitOffset >> 3)] || 0;
+      output[row * width + column] = (byte >> (8 - bits - (bitOffset & 7))) & mask;
     }
   }
   return applyIndexedDecode(output, decode, bits);

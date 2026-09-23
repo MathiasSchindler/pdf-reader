@@ -159,6 +159,8 @@
     let pdf = null;
     let pageIndex = 0;
     let objectUrl = null;
+    let loadToken = 0;
+    let renderToken = 0;
 
     sampleButton.addEventListener("click", () => loadDocument(sampleUrl, "PDF.pdf"));
     previousButton.addEventListener("click", () => renderPage(pageIndex - 1));
@@ -195,12 +197,19 @@
     }
 
     async function loadDocument(url, label) {
+      const token = ++loadToken;
+      ++renderToken;
+      pdf = null;
       setStatus(`Loading ${label}...`);
+      updateButtons();
       try {
-        pdf = await loadPdfCrumb(url);
+        const loadedPdf = await loadPdfCrumb(url);
+        if (token !== loadToken) return;
+        pdf = loadedPdf;
         pageIndex = 0;
         await renderPage(0);
       } catch (error) {
+        if (token !== loadToken) return;
         pdf = null;
         setStatus(error.message, true);
         updateButtons();
@@ -209,12 +218,23 @@
 
     async function renderPage(nextIndex) {
       if (!pdf) return;
+      const token = ++renderToken;
+      const currentPdf = pdf;
       pageIndex = Math.min(Math.max(nextIndex, 0), pdf.pages.length - 1);
-      setStatus(`Rendering ${pageIndex + 1} / ${pdf.pages.length}...`);
+      const currentPage = pageIndex;
+      setStatus(`Rendering ${currentPage + 1} / ${currentPdf.pages.length}...`);
       try {
-        await pdf.renderPage(pageIndex, canvas, { scale: Number(scaleInput.value) || 1 });
-        setStatus(`${pageIndex + 1} / ${pdf.pages.length}`);
+        const renderedCanvas = document.createElement("canvas");
+        await currentPdf.renderPage(currentPage, renderedCanvas, { scale: Number(scaleInput.value) || 1 });
+        if (token !== renderToken) return;
+        canvas.width = renderedCanvas.width;
+        canvas.height = renderedCanvas.height;
+        canvas.style.width = renderedCanvas.style.width;
+        canvas.style.height = renderedCanvas.style.height;
+        canvas.getContext("2d").drawImage(renderedCanvas, 0, 0);
+        setStatus(`${currentPage + 1} / ${currentPdf.pages.length}`);
       } catch (error) {
+        if (token !== renderToken) return;
         setStatus(error.message, true);
       }
       updateButtons();

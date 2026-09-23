@@ -48,6 +48,8 @@ npm run build
 
 The build uses esbuild plus Terser. The source stays modular enough for development, while each distribution profile is emitted as one minified JavaScript file.
 
+Run the browser renderer regression tests with `npm run test:regression`. They cover stream parsing, path painting, canvas allocation limits, indexed image rows, and demo load races. The default canvas budget is 16 million pixels (`maxPagePixels`); it can be adjusted with `loadPdfCrumb(url, { limits: { maxPagePixels: ... } })`.
+
 ## Distribution Files
 
 The public bundle names use `pdf-crumb`:
